@@ -110,15 +110,31 @@ custom_names = {
 }
 
 color_palette = {
-    1: (255, 0, 0), # Class 1, red
-    2: (0, 0, 255), # Class 2, blue
-    3: (0, 255, 0), # Class 2, green
+    # Abdomen IDs
+    1: (255, 255, 255),  
+    2: (0, 0, 255), 
+    3: (255, 0, 0),    
+    4: (255, 255, 0),  
+    5: (0, 255, 0),  
+    6: (0, 200, 100),    
+    7: (200, 150, 100), 
+    8: (250, 150, 100),  
+    9: (255, 200, 100),  
+    10: (180, 0, 0),     
 }
 
 custom_names = {
-    1: "Class 1",
-    2: "Class 2",
-    3: "Class 3",
+    1: "Tools/camera",
+    2: "Colon/rectum",
+    3: "Abdominal wall",
+    4: "Omentum",
+    5: "Liver",
+    6: "Cystic duct",
+    7: "Gallbladder",
+    8: "Hepatic vein",
+    9: "Hepatic ligament",
+    10: "Cystic plate",
+
 }
 
 custom_palette_np = np.array([color_palette.get(i, (0, 0, 0)) for i in range(len(custom_names)+1)])

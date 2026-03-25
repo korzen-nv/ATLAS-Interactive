@@ -143,12 +143,12 @@ class GUI(QWidget):
 
         # Parameters setting
         self.work_mem_min, self.work_mem_min_layout = create_parameter_box(
-            1, 100, 'Min. working memory frames', callback=controller.on_work_min_change)
+            1, 500, 'Min. working memory frames', callback=controller.on_work_min_change)
         self.work_mem_max, self.work_mem_max_layout = create_parameter_box(
-            2, 100, 'Max. working memory frames', callback=controller.on_work_max_change)
+            2, 500, 'Max. working memory frames', callback=controller.on_work_max_change)
         self.long_mem_max, self.long_mem_max_layout = create_parameter_box(
             1000,
-            100000,
+            1000000,
             'Max. long-term memory size',
             step=1000,
             callback=controller.update_config)

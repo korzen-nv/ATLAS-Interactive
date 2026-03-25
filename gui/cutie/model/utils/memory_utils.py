@@ -55,6 +55,7 @@ def do_softmax(
     # similarity: B x N x [HW/P]
     # use inplace with care
     if top_k is not None:
+        top_k = min(top_k, similarity.shape[1])
         values, indices = torch.topk(similarity, k=top_k, dim=1)
 
         x_exp = values.exp_()
