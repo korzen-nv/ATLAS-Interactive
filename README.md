@@ -11,6 +11,20 @@ ATLAS-Interactive is an open-source framework for clip-level anatomical segmenta
 ![Demo](figures/SurgeNetSeg_Labeling_Tool_Demo.gif)
 
 
+## 🌐 Web Version
+
+This fork adds a browser-based interface powered by FastAPI and React, replacing the desktop PySide6 GUI. All annotation features — click/polygon segmentation, forward/backward propagation, multi-object tracking, and video export — work directly in the browser with the inference running server-side.
+
+```bash
+# Start the backend (loads models, serves API)
+python -m server.app
+
+# In another terminal, start the frontend dev server
+cd web && npm install && npm run dev
+```
+
+Then open http://localhost:3000, upload a video, and start annotating. See the `server/` and `web/` directories for the full source.
+
 ## 🛠️ Installation
 
 Tested on Linux, Windows, and MAC OS.

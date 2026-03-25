@@ -149,3 +149,12 @@ dmypy.json
 # Models
 .pt
 .pth
+
+# Node / Frontend
+web/node_modules/
+web/dist/
+web/.vite/
+
+# Server uploads
+_uploads/
+_imports/

@@ -109,17 +109,27 @@ custom_names = {
     46: "Duodenum",
 }
 
-color_palette = {
-    1: (255, 0, 0), # Class 1, red
-    2: (0, 0, 255), # Class 2, blue
-    3: (0, 255, 0), # Class 2, green
-}
+# color_palette = {
+#     1: (255, 0, 0),     # Class 1 - Red
+#     2: (0, 0, 255),     # Class 2 - Blue
+#     3: (0, 255, 0),     # Class 3 - Green
+#     4: (255, 255, 0),   # Class 4 - Yellow
+#     5: (255, 0, 255),   # Class 5 - Magenta
+#     6: (0, 255, 255),   # Class 6 - Cyan
+#     7: (255, 128, 0),   # Class 7 - Orange
+#     8: (128, 0, 255),   # Class 8 - Purple
+# }
 
-custom_names = {
-    1: "Class 1",
-    2: "Class 2",
-    3: "Class 3",
-}
+# custom_names = {
+#     1: "Class 1",
+#     2: "Class 2",
+#     3: "Class 3",
+#     4: "Class 4",
+#     5: "Class 5",
+#     6: "Class 6",
+#     7: "Class 7",
+#     8: "Class 8",
+# }
 
 custom_palette_np = np.array([color_palette.get(i, (0, 0, 0)) for i in range(len(custom_names)+1)])
 custom_palette = custom_palette_np.astype(np.uint8).tobytes()
