@@ -13,7 +13,7 @@ mask_endpoint: masks
 vis_endpoint: vis
 
 # Backend selection: cutie | sam2 | sam3
-backend: sam2
+backend: sam3
 
 amp: True
 weights: gui/weights/cutie-surgenetseg-50k.pth
@@ -30,7 +30,9 @@ sam2_weights: gui/weights/MedSAM2_latest.pt
 sam2_model_cfg: sam2.1/sam2.1_hiera_t.yaml
 
 # SAM 3 config (only used when backend: sam3)
-sam3_weights: gui/weights/sam3_checkpoint_8_new_best.pt
+# Set sam3_weights to null to auto-download from HuggingFace (facebook/sam3)
+# Or provide a path to a local sam3.pt checkpoint
+sam3_weights: null
 sam3_model_cfg: null
 sam3_bpe_path: null
 

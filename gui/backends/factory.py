@@ -97,13 +97,10 @@ def _create_sam2(cfg, device, image_dir, shared_model):
 # -- SAM 3 --------------------------------------------------------------------
 
 def _create_sam3(cfg, device, image_dir, shared_model):
-    from gui.backends.sam3_backend import Sam3PropagationBackend
-    from gui.backends.sam2_backend import Sam2ClickBackend
+    from gui.backends.sam3_backend import Sam3ClickBackend, Sam3PropagationBackend
 
-    checkpoint = cfg.get('sam3_weights')
+    checkpoint = cfg.get('sam3_weights')  # None → auto-download from HF
     bpe_path = cfg.get('sam3_bpe_path')
-    if not checkpoint:
-        raise ValueError("sam3_weights must be set in config when using backend: sam3")
 
     propagation = Sam3PropagationBackend(
         checkpoint=checkpoint,
@@ -111,13 +108,12 @@ def _create_sam3(cfg, device, image_dir, shared_model):
         device=device,
         image_dir=image_dir,
         num_objects=cfg.num_objects,
-        shared_predictor=shared_model,
-    )
-    # SAM 3 is backward-compatible with SAM 2 for point/click interaction
-    click = Sam2ClickBackend(
-        checkpoint=checkpoint,
-        model_cfg=cfg.get('sam3_model_cfg'),
-        device=device,
         shared_model=shared_model,
+    )
+    # Share the tracker from the video model for click-based interaction
+    # so we don't load the backbone twice.
+    click = Sam3ClickBackend(
+        tracker_model=propagation._model.tracker,
+        device=device,
     )
     return propagation, click
