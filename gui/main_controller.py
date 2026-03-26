@@ -400,9 +400,13 @@ class MainController():
 
             self.gui.text(f'Propagation started at t={self.curr_ti}.')
             self.processor.clear_sensory_memory()
+            if hasattr(self.processor, 'set_propagation_direction'):
+                self.processor.set_propagation_direction(
+                    self.propagate_direction == 'backward')
             self.curr_prob = self.processor.step(self.curr_image_torch,
                                                  self.curr_prob[1:],
-                                                 idx_mask=False)
+                                                 idx_mask=False,
+                                                 frame_idx=self.curr_ti)
             self.curr_mask = torch_prob_to_numpy_mask(self.curr_prob)
             # clear
             self.interacted_prob = None
@@ -426,7 +430,8 @@ class MainController():
                 self.curr_image_torch = self.curr_image_torch.to(self.device, non_blocking=True)
                 self.propagate_fn()
 
-                self.curr_prob = self.processor.step(self.curr_image_torch)
+                self.curr_prob = self.processor.step(self.curr_image_torch,
+                                                     frame_idx=self.curr_ti)
                 self.curr_mask = torch_prob_to_numpy_mask(self.curr_prob)
 
                 self.save_current_mask()
@@ -462,6 +467,7 @@ class MainController():
             self.curr_prob = self.processor.step(self.curr_image_torch,
                                                  self.curr_prob[1:],
                                                  idx_mask=False,
+                                                 frame_idx=self.curr_ti,
                                                  force_permanent=True)
             self.update_memory_gauges()
             self.update_gpu_gauges()

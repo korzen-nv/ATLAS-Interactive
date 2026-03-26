@@ -25,6 +25,7 @@ class CutieBackend:
         mask: Optional[torch.Tensor] = None,
         objects: Optional[List[int]] = None,
         *,
+        frame_idx: Optional[int] = None,
         idx_mask: bool = True,
         end: bool = False,
         force_permanent: bool = False,

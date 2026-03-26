@@ -32,6 +32,7 @@ class PropagationBackend(Protocol):
         mask: Optional[torch.Tensor] = None,
         objects: Optional[List[int]] = None,
         *,
+        frame_idx: Optional[int] = None,
         idx_mask: bool = True,
         end: bool = False,
         force_permanent: bool = False,
@@ -45,6 +46,8 @@ class PropagationBackend(Protocol):
             image: (3, H, W) float tensor, values in [0, 1].
             mask: (H, W) index mask or (num_objects, H, W) probs, or None.
             objects: list of object IDs present in the mask.
+            frame_idx: absolute video frame index (used by SAM backends
+                       for correct frame synchronisation; ignored by CUTIE).
             idx_mask: if True, mask contains object index per pixel.
             end: hint that this is the final frame (skip memory update).
             force_permanent: mark this frame as permanent memory.

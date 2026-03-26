@@ -112,12 +112,16 @@ class Sam2PropagationBackend:
         mask: Optional[torch.Tensor] = None,
         objects: Optional[List[int]] = None,
         *,
+        frame_idx: Optional[int] = None,
         idx_mask: bool = True,
         end: bool = False,
         force_permanent: bool = False,
     ) -> torch.Tensor:
         self._ensure_state()
-        self._curr_ti += 1
+        if frame_idx is not None:
+            self._curr_ti = frame_idx
+        else:
+            self._curr_ti += 1
 
         if mask is not None:
             return self._step_with_mask(
@@ -157,7 +161,12 @@ class Sam2PropagationBackend:
         return self._binary_dict_to_prob(binary_masks)
 
     def _step_propagate(self) -> torch.Tensor:
-        """Consume the next frame from the SAM propagation generator."""
+        """Consume the next frame from the SAM propagation generator.
+
+        Advances the generator until the yielded frame index matches
+        ``self._curr_ti``, ensuring the returned mask corresponds to the
+        frame the controller is currently displaying.
+        """
         if self._propagation_gen is None:
             self._propagation_gen = self._predictor.propagate_in_video(
                 self._state, reverse=self._reverse,
@@ -165,9 +174,16 @@ class Sam2PropagationBackend:
 
         try:
             frame_idx, obj_ids, masks = next(self._propagation_gen)
+            # Skip frames until we reach the one the controller expects.
+            while frame_idx != self._curr_ti:
+                log.debug(
+                    "Skipping SAM 2 generator frame %d (expecting %d)",
+                    frame_idx, self._curr_ti,
+                )
+                frame_idx, obj_ids, masks = next(self._propagation_gen)
         except StopIteration:
-            # Propagation exhausted — return empty mask
-            log.warning("SAM 2 propagation generator exhausted")
+            log.warning("SAM 2 propagation generator exhausted at frame %d",
+                        self._curr_ti)
             prob = torch.zeros(
                 self._num_objects + 1, 1, 1, device=self._device,
             )
