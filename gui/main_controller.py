@@ -17,17 +17,14 @@ from torchvision.transforms.functional import to_tensor
 import numpy as np
 from omegaconf import DictConfig, open_dict
 
-from gui.cutie.model.cutie import CUTIE
-from gui.cutie.inference.inference_core import InferenceCore
+from gui.backends.factory import create_backends
 
 from gui.interaction import *
 from gui.interactive_utils import *
 from gui.resource_manager import ResourceManager
 from gui.gui import GUI
-from gui.click_controller import ClickController
 from gui.reader import PropagationReader, get_data_loader
 from gui.exporter import convert_frames_to_video, convert_mask_to_binary
-from gui.cutie.utils.download_models import download_models_if_needed
 
 from gui.cutie.utils.palette import custom_palette_np # added
 
@@ -59,14 +56,14 @@ class MainController():
         self.device = cfg['device']
         self.amp = cfg['amp']
 
-        # initializing the network(s)
-        self.initialize_networks()
-
         # main components
         self.res_man = ResourceManager(cfg)
         if 'workspace_init_only' in cfg and cfg['workspace_init_only']:
             return
-        self.processor = InferenceCore(self.cutie, self.cfg)
+
+        # initializing the network(s) — after ResourceManager so image_dir is available
+        self.initialize_networks()
+        self.processor = self._propagation
         self.gui = GUI(self, self.cfg)
 
         # initialize control info
@@ -107,10 +104,12 @@ class MainController():
         # initialize stuff
         self.update_memory_gauges()
         self.update_gpu_gauges()
-        self.gui.work_mem_min.setValue(self.processor.memory.min_mem_frames)
-        self.gui.work_mem_max.setValue(self.processor.memory.max_mem_frames)
-        self.gui.long_mem_max.setValue(self.processor.memory.max_long_tokens)
-        self.gui.mem_every_box.setValue(self.processor.mem_every)
+        if hasattr(self.processor, 'memory'):
+            # CUTIE-specific memory tuning spinboxes
+            self.gui.work_mem_min.setValue(self.processor.memory.min_mem_frames)
+            self.gui.work_mem_max.setValue(self.processor.memory.max_mem_frames)
+            self.gui.long_mem_max.setValue(self.processor.memory.max_long_tokens)
+            self.gui.mem_every_box.setValue(self.processor.mem_every)
 
         # for exporting videos
         self.output_fps = cfg['output_fps']
@@ -136,12 +135,9 @@ class MainController():
         self.update_config()
 
     def initialize_networks(self) -> None:
-        download_models_if_needed()
-        self.cutie = CUTIE(self.cfg).eval().to(self.device)
-        model_weights = torch.load(self.cfg.weights, map_location=self.device)
-        self.cutie.load_weights(model_weights)
-
-        self.click_ctrl = ClickController(self.cfg.ritm_weights, device=self.device)
+        self._propagation, self.click_ctrl = create_backends(
+            self.cfg, self.device, image_dir=self.res_man.image_dir,
+        )
 
     def hit_number_key(self, number: int):
         if number == self.curr_object:
@@ -567,18 +563,24 @@ class MainController():
 
     def update_gpu_gauges(self):
         if 'cuda' in self.device:
-            info = torch.cuda.mem_get_info()
-            global_free, global_total = info
-            global_free /= (2**30)
-            global_total /= (2**30)
-            global_used = global_total - global_free
+            try:
+                info = torch.cuda.mem_get_info()
+                global_free, global_total = info
+                global_free /= (2**30)
+                global_total /= (2**30)
+                global_used = global_total - global_free
 
-            self.gui.gpu_mem_gauge.setFormat(f'{global_used:.1f} GB / {global_total:.1f} GB')
-            self.gui.gpu_mem_gauge.setValue(round(global_used / global_total * 100))
+                self.gui.gpu_mem_gauge.setFormat(f'{global_used:.1f} GB / {global_total:.1f} GB')
+                self.gui.gpu_mem_gauge.setValue(round(global_used / global_total * 100))
 
-            used_by_torch = torch.cuda.max_memory_allocated() / (2**30)
-            self.gui.torch_mem_gauge.setFormat(f'{used_by_torch:.1f} GB / {global_total:.1f} GB')
-            self.gui.torch_mem_gauge.setValue(round(used_by_torch / global_total * 100 / 1024))
+                used_by_torch = torch.cuda.max_memory_allocated() / (2**30)
+                self.gui.torch_mem_gauge.setFormat(f'{used_by_torch:.1f} GB / {global_total:.1f} GB')
+                self.gui.torch_mem_gauge.setValue(round(used_by_torch / global_total * 100))
+            except torch.cuda.CudaError:
+                self.gui.gpu_mem_gauge.setFormat('OOM')
+                self.gui.gpu_mem_gauge.setValue(100)
+                self.gui.torch_mem_gauge.setFormat('OOM')
+                self.gui.torch_mem_gauge.setValue(100)
         elif 'mps' in self.device:
             mem_used = mps.current_allocated_memory() / (2**30)
             self.gui.gpu_mem_gauge.setFormat(f'{mem_used:.1f} GB')
@@ -596,23 +598,20 @@ class MainController():
 
     def update_memory_gauges(self):
         try:
-            curr_perm_tokens = self.processor.memory.work_mem.perm_size(0)
-            self.gui.perm_mem_gauge.setFormat(f'{curr_perm_tokens} / {curr_perm_tokens}')
-            self.gui.perm_mem_gauge.setValue(100)
+            status = self.processor.get_memory_status()
 
-            max_work_tokens = self.processor.memory.max_work_tokens
-            max_long_tokens = self.processor.memory.max_long_tokens
+            self.gui.perm_mem_gauge.setFormat(f'{status.perm_tokens} / {status.perm_tokens}')
+            self.gui.perm_mem_gauge.setValue(100 if status.perm_tokens else 0)
 
-            curr_work_tokens = self.processor.memory.work_mem.non_perm_size(0)
-            curr_long_tokens = self.processor.memory.long_mem.non_perm_size(0)
+            self.gui.work_mem_gauge.setFormat(f'{status.work_tokens} / {status.max_work_tokens}')
+            self.gui.work_mem_gauge.setValue(
+                round(status.work_tokens / max(status.max_work_tokens, 1) * 100))
 
-            self.gui.work_mem_gauge.setFormat(f'{curr_work_tokens} / {max_work_tokens}')
-            self.gui.work_mem_gauge.setValue(round(curr_work_tokens / max_work_tokens * 100))
+            self.gui.long_mem_gauge.setFormat(f'{status.long_tokens} / {status.max_long_tokens}')
+            self.gui.long_mem_gauge.setValue(
+                round(status.long_tokens / max(status.max_long_tokens, 1) * 100))
 
-            self.gui.long_mem_gauge.setFormat(f'{curr_long_tokens} / {max_long_tokens}')
-            self.gui.long_mem_gauge.setValue(round(curr_long_tokens / max_long_tokens * 100))
-
-        except AttributeError as e:
+        except AttributeError:
             self.gui.work_mem_gauge.setFormat('Unknown')
             self.gui.long_mem_gauge.setFormat('Unknown')
             self.gui.work_mem_gauge.setValue(0)

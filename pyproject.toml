@@ -16,7 +16,7 @@ version = "1.0.0"
 authors = [{ name = "Ronald L.P.D. de Jong", email = "r.l.p.d.d.jong@tue.nl" }, {name = "Tim J.M. Jaspers", email = "t.j.m.jaspers@tue.nl"}]
 description = ""
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 classifiers = [
   "Programming Language :: Python :: 3",
   "Operating System :: OS Independent",
@@ -45,6 +45,19 @@ dependencies = [
   'av >= 0.5.2',
   'requests',
   'pyqtdarktheme',
+  'sam2',
+]
+
+[project.optional-dependencies]
+desktop = [
+  'PySide6 >= 6.2.0',
+  'pyqtdarktheme',
+]
+sam2 = [
+
+]
+sam3 = [
+  'sam3',
 ]
 
 [tool.hatch.build.targets.wheel]

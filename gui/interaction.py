@@ -9,7 +9,7 @@ from typing import Tuple
 import torch
 import torch.nn.functional as F
 
-from gui.click_controller import ClickController
+from gui.backends.base import ClickBackend
 
 
 def aggregate_wbg(prob: torch.Tensor, keep_bg: bool = False, hard: bool = False) -> torch.Tensor:
@@ -29,7 +29,7 @@ def aggregate_wbg(prob: torch.Tensor, keep_bg: bool = False, hard: bool = False)
 
 class Interaction:
     def __init__(self, image: torch.Tensor, prev_mask: torch.Tensor, true_size: Tuple[int, int],
-                 controller: ClickController):
+                 controller: ClickBackend):
         self.image = image
         self.prev_mask = prev_mask
         self.controller = controller
@@ -45,7 +45,7 @@ class Interaction:
 
 class ClickInteraction(Interaction):
     def __init__(self, image: torch.Tensor, prev_mask: torch.Tensor, true_size: Tuple[int, int],
-                 controller: ClickController, tar_obj: int):
+                 controller: ClickBackend, tar_obj: int):
         """
         prev_mask in a prob. form
         """

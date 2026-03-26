@@ -39,9 +39,12 @@ try:
 except:
     device = torch.device("cpu")
 
-color_map_np = np.frombuffer(custom_palette, dtype=np.uint8).reshape(-1, 3).copy()
+_raw_map = np.frombuffer(custom_palette, dtype=np.uint8).reshape(-1, 3).copy()
 # scales for better visualization
-color_map_np = (color_map_np.astype(np.float32) * 1.5).clip(0, 255).astype(np.uint8)
+_raw_map = (_raw_map.astype(np.float32) * 1.5).clip(0, 255).astype(np.uint8)
+# pad to 256 entries so stale masks with out-of-range class IDs don't crash
+color_map_np = np.zeros((256, 3), dtype=np.uint8)
+color_map_np[:len(_raw_map)] = _raw_map
 color_map = color_map_np.tolist()
 color_map_torch = torch.from_numpy(color_map_np).to(device) / 255
 
