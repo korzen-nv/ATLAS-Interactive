@@ -50,6 +50,14 @@ class GUI(QWidget):
         self.backward_run_button.clicked.connect(controller.on_backward_propagation)
         self.backward_run_button.setMinimumWidth(150)
 
+        self.fast_forward_button = QPushButton('Fast forward')
+        self.fast_forward_button.clicked.connect(controller.on_fast_forward_propagation)
+        self.fast_forward_button.setToolTip('Propagate forward without preview (Shift+F)')
+
+        self.fast_backward_button = QPushButton('Fast backward')
+        self.fast_backward_button.clicked.connect(controller.on_fast_backward_propagation)
+        self.fast_backward_button.setToolTip('Propagate backward without preview (Shift+B)')
+
         # universal progressbar
         self.progressbar = QProgressBar()
         self.progressbar.setMinimum(0)
@@ -230,6 +238,8 @@ class GUI(QWidget):
         control_topbox.addWidget(self.commit_button)
         control_topbox.addWidget(self.forward_run_button)
         control_topbox.addWidget(self.backward_run_button)
+        control_topbox.addWidget(self.fast_forward_button)
+        control_topbox.addWidget(self.fast_backward_button)
         control_botbox.addWidget(self.progressbar)
         control_botbox.addWidget(self.fps_label)
         control_subbox.addLayout(control_topbox)
@@ -319,6 +329,12 @@ class GUI(QWidget):
         QShortcut(QKeySequence(Qt.Key.Key_F), self).activated.connect(controller.on_forward_propagation)
         QShortcut(QKeySequence(Qt.Key.Key_Space), self).activated.connect(controller.on_forward_propagation)
         QShortcut(QKeySequence(Qt.Key.Key_B), self).activated.connect(controller.on_backward_propagation)
+
+        # fast propagation (no preview) shortcuts
+        QShortcut(QKeySequence(Qt.Key.Key_F | Qt.KeyboardModifier.ShiftModifier),
+                    self).activated.connect(controller.on_fast_forward_propagation)
+        QShortcut(QKeySequence(Qt.Key.Key_B | Qt.KeyboardModifier.ShiftModifier),
+                    self).activated.connect(controller.on_fast_backward_propagation)
         
         # Toggle visualization mode
         QShortcut(QKeySequence(Qt.Key.Key_T), self).activated.connect(controller.on_toggle_vis_mode)
@@ -421,19 +437,39 @@ class GUI(QWidget):
 
     def forward_propagation_start(self):
         self.backward_run_button.setEnabled(False)
+        self.fast_forward_button.setEnabled(False)
+        self.fast_backward_button.setEnabled(False)
         self.forward_run_button.setText('Pause propagation')
 
     def backward_propagation_start(self):
         self.forward_run_button.setEnabled(False)
+        self.fast_forward_button.setEnabled(False)
+        self.fast_backward_button.setEnabled(False)
         self.backward_run_button.setText('Pause propagation')
+
+    def fast_forward_propagation_start(self):
+        self.forward_run_button.setEnabled(False)
+        self.backward_run_button.setEnabled(False)
+        self.fast_backward_button.setEnabled(False)
+        self.fast_forward_button.setText('Pause fast')
+
+    def fast_backward_propagation_start(self):
+        self.forward_run_button.setEnabled(False)
+        self.backward_run_button.setEnabled(False)
+        self.fast_forward_button.setEnabled(False)
+        self.fast_backward_button.setText('Pause fast')
 
     def pause_propagation(self):
         self.forward_run_button.setEnabled(True)
         self.backward_run_button.setEnabled(True)
+        self.fast_forward_button.setEnabled(True)
+        self.fast_backward_button.setEnabled(True)
         self.clear_all_mem_button.setEnabled(True)
         self.clear_non_perm_mem_button.setEnabled(True)
         self.forward_run_button.setText('Propagate forward')
         self.backward_run_button.setText('propagate backward')
+        self.fast_forward_button.setText('Fast forward')
+        self.fast_backward_button.setText('Fast backward')
         self.tl_slider.setEnabled(True)
 
     def process_events(self):

@@ -151,6 +151,17 @@ class MainController():
         if 'cuda' in self.device:
             self.cutie = self.cutie.to(memory_format=torch.channels_last)
 
+        # torch.compile the pixel encoder (pure ResNet, fixed shapes during propagation).
+        # This is the most expensive per-frame component and compiles cleanly.
+        # Other components have dynamic shapes (memory size, object count) and cannot compile.
+        if 'cuda' in self.device:
+            try:
+                self.cutie.pixel_encoder = torch.compile(self.cutie.pixel_encoder)
+                self.cutie.key_proj = torch.compile(self.cutie.key_proj)
+                log.info('torch.compile enabled for pixel_encoder and key_proj')
+            except Exception as e:
+                log.warning(f'torch.compile failed, falling back to eager mode: {e}')
+
         self.click_ctrl = ClickController(self.cfg.ritm_weights, device=self.device)
 
     def hit_number_key(self, number: int):
@@ -402,6 +413,26 @@ class MainController():
             self.propagate_direction = 'backward'
             self.on_propagate()
 
+    def on_fast_forward_propagation(self):
+        if self.propagating:
+            self.propagating = False
+            self.propagate_direction = 'none'
+        else:
+            self.propagate_fn = self.on_next_frame
+            self.gui.fast_forward_propagation_start()
+            self.propagate_direction = 'forward'
+            self.on_propagate_fast()
+
+    def on_fast_backward_propagation(self):
+        if self.propagating:
+            self.propagating = False
+            self.propagate_direction = 'none'
+        else:
+            self.propagate_fn = self.on_prev_frame
+            self.gui.fast_backward_propagation_start()
+            self.propagate_direction = 'backward'
+            self.on_propagate_fast()
+
     def on_pause(self):
         self.propagating = False
         self.gui.text(f'Propagation stopped at t={self.curr_ti}.')
@@ -464,6 +495,98 @@ class MainController():
             self.curr_frame_dirty = False
             self.on_pause()
             self.on_slider_update()
+            self.gui.process_events()
+
+    def on_propagate_fast(self):
+        # Fast propagation: skip visualization, keep tensors on GPU, save masks in bulk at the end.
+        # Only process_events every N frames so the user can still pause.
+        import time
+        gui_check_interval = 20
+
+        with autocast(self.device, enabled=(self.amp and self.device == 'cuda')):
+            self.convert_current_image_mask_torch()
+
+            self.gui.text(f'Fast propagation started at t={self.curr_ti}.')
+            self.processor.clear_sensory_memory()
+            self.curr_prob = self.processor.step(self.curr_image_torch,
+                                                 self.curr_prob[1:],
+                                                 idx_mask=False)
+            # Save starting frame mask normally
+            self.curr_mask = torch_prob_to_numpy_mask(self.curr_prob)
+            self.interacted_prob = None
+            self.reset_this_interaction()
+            self.save_current_mask()
+
+            self.propagating = True
+            self.gui.clear_all_mem_button.setEnabled(False)
+            self.gui.clear_non_perm_mem_button.setEnabled(False)
+            self.gui.tl_slider.setEnabled(False)
+
+            dataset = PropagationReader(self.res_man, self.curr_ti, self.propagate_direction)
+            loader = get_data_loader(dataset, self.cfg.num_read_workers)
+
+            # Collect (frame_index, cpu_mask) pairs for deferred disk saving.
+            # We do the argmax+cpu transfer per frame (cheap, ~2ms) but skip
+            # visualization, canvas update, gauge update, and process_events.
+            deferred_masks = []
+            frames_done = 0
+            t_start = time.monotonic()
+
+            for data in loader:
+                if not self.propagating:
+                    break
+                self.curr_image_np, self.curr_image_torch = data
+                self.curr_image_torch = self.curr_image_torch.to(self.device, non_blocking=True)
+                self.propagate_fn()
+
+                self.curr_prob = self.processor.step(self.curr_image_torch)
+                # argmax + .cpu() is ~2ms -- much cheaper than visualization (~30ms)
+                mask = torch_prob_to_numpy_mask(self.curr_prob)
+                deferred_masks.append((self.curr_ti, mask))
+
+                frames_done += 1
+
+                # Minimal UI: update slider + check for pause every N frames
+                if frames_done % gui_check_interval == 0:
+                    self.gui.tl_slider.blockSignals(True)
+                    self.gui.tl_slider.setValue(self.curr_ti)
+                    self.gui.tl_slider.blockSignals(False)
+                    self.gui.lcd.setText('{: 5d} / {: 5d}'.format(self.curr_ti, self.T - 1))
+                    self.gui.process_events()
+
+                if self.curr_ti == 0 or self.curr_ti == self.T - 1:
+                    break
+
+            elapsed = time.monotonic() - t_start
+            fps = frames_done / elapsed if elapsed > 0 else 0
+            self.gui.fps_label.setText(f'Fast: {fps:.1f} fps ({frames_done} frames)')
+
+            # Update state to the final frame before saving
+            if deferred_masks:
+                self.curr_mask = deferred_masks[-1][1]
+
+            self.propagating = False
+            self.curr_frame_dirty = False
+            self.on_pause()
+            self.show_current_frame()
+            self.update_memory_gauges()
+            self.on_slider_update()
+
+            # Drain deferred masks into the save queue in a background thread
+            # so the UI stays responsive and the propagation loop isn't blocked.
+            num_masks = len(deferred_masks)
+
+            def _drain_deferred(masks, res_man, gui):
+                for ti, mask in masks:
+                    res_man.save_mask(ti, mask)
+                gui.text(f'All {len(masks)} masks saved.')
+
+            from threading import Thread
+            drain_thread = Thread(target=_drain_deferred,
+                                  args=(deferred_masks, self.res_man, self.gui),
+                                  daemon=True)
+            drain_thread.start()
+            self.gui.text(f'Fast propagation done. {fps:.1f} fps, saving {num_masks} masks...')
             self.gui.process_events()
 
     def pause_propagation(self):
