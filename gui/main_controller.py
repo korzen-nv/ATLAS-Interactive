@@ -1,4 +1,5 @@
 import os
+from collections import deque
 from os import path
 import logging
 from typing import Literal
@@ -84,6 +85,9 @@ class MainController():
         self.curr_prob: torch.Tensor = torch.zeros((self.num_objects + 1, self.h, self.w),
                                                    dtype=torch.float).to(self.device)
         self.curr_prob[0] = 1
+
+        # undo stack — stores (frame_idx, mask, prob) snapshots before each edit
+        self._undo_stack: deque = deque(maxlen=20)
 
         # visualization info
         self.vis_mode: str = 'davis'
@@ -194,8 +198,16 @@ class MainController():
                 radius = 4
             cv2.circle(self.vis_image, pt, radius=radius, color=color, thickness=-1)
 
-    def click_fn(self, action: Literal['left', 'right', 'middle'], x: int, y: int):
+    def click_fn(self, action: Literal['left', 'right', 'middle', 'pick'], x: int, y: int):
         if self.propagating:
+            return
+
+        if action == 'pick':
+            obj_id = int(self.curr_mask[int(y), int(x)])
+            if obj_id > 0 and obj_id != self.curr_object:
+                self.hit_number_key(obj_id)
+            elif obj_id == 0:
+                self.gui.text('No object at this position.')
             return
 
         if not hasattr(self, 'in_polygon_mode'):
@@ -230,6 +242,7 @@ class MainController():
                         mask = np.zeros((self.h, self.w), dtype=np.uint8)
                         pts_np = np.array([[(int(px), int(py)) for px, py in self.polygon_points]], dtype=np.int32)
                         cv2.fillPoly(mask, pts_np, color=1)
+                        self._snapshot_mask()
                         self.curr_mask[mask > 0] = self.curr_object
                         self.save_current_mask()
 
@@ -345,6 +358,24 @@ class MainController():
     def set_vis_mode(self):
         self.vis_mode = self.gui.combo.currentText()
         self.show_current_frame()
+
+    def _snapshot_mask(self):
+        """Push the current mask state onto the undo stack (before mutation)."""
+        prob = self.curr_prob.cpu().clone() if self.curr_prob is not None else None
+        self._undo_stack.append((self.curr_ti, self.curr_mask.copy(), prob))
+
+    def on_undo(self):
+        if self.propagating or not self._undo_stack:
+            return
+        ti, mask, prob = self._undo_stack.pop()
+        self.curr_ti = ti
+        self.curr_mask = mask
+        self.curr_prob = prob.to(self.device) if prob is not None else None
+        self.save_current_mask()
+        self.reset_this_interaction()
+        self.show_current_frame()
+        self.gui.update_slider(self.curr_ti)
+        self.gui.text('Undo.')
 
     def save_current_mask(self):
         # save mask to hard disk
@@ -525,6 +556,7 @@ class MainController():
         self.output_bitrate = self.gui.bitrate_dial.value()
 
     def update_interacted_mask(self):
+        self._snapshot_mask()
         self.curr_prob = self.interacted_prob
         self.curr_mask = torch_prob_to_numpy_mask(self.interacted_prob)
         self.save_current_mask()
@@ -538,6 +570,7 @@ class MainController():
             self.click_ctrl.unanchor()
 
     def on_reset_mask(self):
+        self._snapshot_mask()
         self.curr_mask.fill(0)
         if self.curr_prob is not None:
             self.curr_prob.fill_(0)
@@ -547,6 +580,7 @@ class MainController():
         self.show_current_frame()
 
     def on_reset_object(self):
+        self._snapshot_mask()
         self.curr_mask[self.curr_mask == self.curr_object] = 0
         if self.curr_prob is not None:
             self.curr_prob[self.curr_object] = 0
@@ -685,6 +719,7 @@ class MainController():
             self.gui.text(f'Expected {self.num_objects} objects. Got {mask.max()} objects instead.')
         else:
             self.gui.text(f'Mask file {file_name} loaded.')
+            self._snapshot_mask()
             self.curr_image_torch = self.curr_prob = None
             self.curr_mask = mask
             self.show_current_frame()

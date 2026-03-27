@@ -318,6 +318,10 @@ class GUI(QWidget):
         # Toggle visualization mode
         QShortcut(QKeySequence(Qt.Key.Key_T), self).activated.connect(controller.on_toggle_vis_mode)
 
+        # undo last mask edit
+        QShortcut(QKeySequence(Qt.Key.Key_Z | Qt.KeyboardModifier.ControlModifier),
+                    self).activated.connect(controller.on_undo)
+
         # quit shortcut
         QShortcut(QKeySequence(Qt.Key.Key_Q), self).activated.connect(self.close)
 
@@ -440,7 +444,10 @@ class GUI(QWidget):
 
         ex, ey = self.get_scaled_pos(event.position().x(), event.position().y())
         if event.button() == Qt.MouseButton.LeftButton:
-            action = 'left'
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                action = 'pick'
+            else:
+                action = 'left'
         elif event.button() == Qt.MouseButton.RightButton:
             action = 'right'
         elif event.button() == Qt.MouseButton.MiddleButton:

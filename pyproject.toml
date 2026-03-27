@@ -40,12 +40,12 @@ dependencies = [
   'PySide6 >= 6.2.0',
   'charset-normalizer >= 3.1.0',
   'netifaces >= 0.11.0',
-  'cchardet >= 2.1.7',
   'easydict',
   'av >= 0.5.2',
   'requests',
   'pyqtdarktheme',
   'sam2',
+  'sam3 @ file:///home/pkorzeniowsk/Projects/sam3/sam3',
 ]
 
 [project.optional-dependencies]
@@ -57,7 +57,7 @@ sam2 = [
 
 ]
 sam3 = [
-  'sam3',
+  'sam3 @ file:///home/pkorzeniowsk/Projects/sam3/sam3',
 ]
 
 [tool.hatch.build.targets.wheel]

@@ -23,16 +23,17 @@ ritm_weights: gui/weights/ritm-surgenetseg-50k.pth
 #sam2_weights:  gui/weights/sam2.1_hiera_large.pt
 #sam2_model_cfg: sam2.1/sam2.1_hiera_l.yaml
 
-#sam2_weights: gui/weights/surgisam2_chkpt_26.pt
-#sam2_model_cfg: sam2.1/sam2.1_hiera_b+.yaml
+sam2_weights: gui/weights/surgisam2_chkpt_26.pt
+sam2_model_cfg: sam2.1/sam2.1_hiera_b+.yaml
 
-sam2_weights: gui/weights/MedSAM2_latest.pt
-sam2_model_cfg: sam2.1/sam2.1_hiera_t.yaml
+#sam2_weights: gui/weights/MedSAM2_latest.pt
+#sam2_model_cfg: sam2.1/sam2.1_hiera_t.yaml
 
 # SAM 3 config (only used when backend: sam3)
 # Set sam3_weights to null to auto-download from HuggingFace (facebook/sam3)
 # Or provide a path to a local sam3.pt checkpoint
-sam3_weights: null
+#sam3_weights: gui/weights/sam3_sean_merged.pt
+sam3_weights: gui/weights/sam3.pt
 sam3_model_cfg: null
 sam3_bpe_path: null
 

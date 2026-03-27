@@ -1,10 +1,13 @@
-"""SAM 3 backend — standalone implementation for the SAM 3 video model.
+"""SAM 3 backend — uses SAM 3's tracker (SAM2-compatible API) for mask
+propagation, and SAM3InteractiveImagePredictor for click segmentation.
 
-Unlike SAM 2, SAM 3 has a fundamentally different API:
-- ``init_state`` takes ``resource_path`` (not ``video_path``)
-- No ``add_new_mask``; uses ``add_prompt`` with points/text/boxes
-- ``propagate_in_video`` yields ``(frame_idx, outputs_dict)`` not tuples
-- Has native text-prompt support via a built-in BPE tokenizer
+The SAM 3 model has two pipelines:
+  1. **VG (Video Grounding)** — detection + tracking, used for text/box prompts.
+  2. **Tracker** — SAM2-compatible API with ``add_new_mask`` / ``propagate_in_video``.
+
+For interactive mask propagation (click → mask → propagate) we use the
+tracker directly, which avoids the VG pipeline's hotstart / detection
+requirements.  Text prompt support uses the VG model lazily.
 """
 from __future__ import annotations
 
@@ -15,6 +18,7 @@ import numpy as np
 import torch
 
 from gui.backends.base import MemoryStatus
+from gui.backends.sam2_backend import _MultiThreadFrameLoader
 
 log = logging.getLogger(__name__)
 
@@ -23,11 +27,12 @@ log = logging.getLogger(__name__)
 
 
 class Sam3PropagationBackend:
-    """Wraps the SAM 3 video model for mask propagation.
+    """Wraps the SAM 3 *tracker* (``Sam3TrackerPredictor``) for mask
+    propagation using the same ``add_new_mask`` / ``propagate_in_video``
+    interface as SAM 2.
 
-    Uses the lower-level ``Sam3VideoInferenceWithInstanceInteractivity``
-    model directly (via ``build_sam3_video_model``) rather than the
-    multi-GPU predictor wrapper to avoid unnecessary distributed overhead.
+    The full VG model is kept for text-prompt support but its state is
+    initialised lazily (only when ``add_text_prompt`` is called).
     """
 
     supports_text_prompts: bool = True
@@ -47,16 +52,22 @@ class Sam3PropagationBackend:
         else:
             self._model = self._build_model(checkpoint, bpe_path, device)
 
+        # The tracker exposes a SAM2-compatible API.
+        self._tracker = self._model.tracker
+
         self._device = device
         self._image_dir = image_dir
         self._num_objects = num_objects
 
-        # Internal tracking state
+        # Tracker inference state (SAM2-style)
         self._state: Optional[dict] = None
         self._propagation_gen = None
         self._curr_ti: int = -1
         self._reverse: bool = False
         self._object_ids: set = set()
+
+        # VG model state — lazily initialised for text prompts only
+        self._vg_state: Optional[dict] = None
 
         # Anchor bookkeeping
         self._permanent_anchors: Dict[int, Tuple[torch.Tensor, List[int]]] = {}
@@ -81,16 +92,41 @@ class Sam3PropagationBackend:
     # -- State management ------------------------------------------------------
 
     def _ensure_state(self) -> None:
+        """Lazily initialise the tracker state from the image directory."""
         if self._state is None:
             if self._image_dir is None:
                 raise RuntimeError(
                     "SAM 3 backend requires image_dir (workspace/images) "
                     "to be set before the first step()."
                 )
-            self._state = self._model.init_state(
+            # Temporarily replace SAM 3's single-thread loader with our
+            # multi-threaded version so frames are decoded in parallel.
+            import sam3.model.utils.sam2_utils as _sam3_misc
+
+            _orig_loader = _sam3_misc.AsyncVideoFrameLoader
+            _sam3_misc.AsyncVideoFrameLoader = _MultiThreadFrameLoader
+            try:
+                self._state = self._tracker.init_state(
+                    video_path=self._image_dir,
+                    offload_video_to_cpu=True,
+                    offload_state_to_cpu=True,
+                    async_loading_frames=True,
+                )
+            finally:
+                _sam3_misc.AsyncVideoFrameLoader = _orig_loader
+            log.info("SAM 3 tracker state initialised from %s", self._image_dir)
+
+    def _ensure_vg_state(self) -> None:
+        """Lazily initialise the full VG model state (for text prompts)."""
+        if self._vg_state is None:
+            if self._image_dir is None:
+                raise RuntimeError(
+                    "SAM 3 backend requires image_dir for text prompts."
+                )
+            self._vg_state = self._model.init_state(
                 resource_path=self._image_dir,
             )
-            log.info("SAM 3 state initialised from %s", self._image_dir)
+            log.info("SAM 3 VG state initialised from %s", self._image_dir)
 
     def _invalidate_generator(self) -> None:
         self._propagation_gen = None
@@ -130,25 +166,15 @@ class Sam3PropagationBackend:
         idx_mask: bool,
         force_permanent: bool,
     ) -> torch.Tensor:
-        """Register an anchor frame — convert mask to point prompts for SAM 3."""
+        """Register an anchor frame with a user-provided mask."""
         if objects is None:
             objects = list(range(1, self._num_objects + 1))
 
         binary_masks = self._to_binary_masks(mask, objects, idx_mask)
 
         for obj_id, bmask in binary_masks.items():
-            points, labels = self._mask_to_points(bmask)
-            if points is None:
-                continue
-            # SAM 3 add_prompt with points (normalized coords by default)
-            H, W = bmask.shape[-2:]
-            norm_points = [[p[0] / W, p[1] / H] for p in points]
-            self._model.add_prompt(
-                inference_state=self._state,
-                frame_idx=self._curr_ti,
-                points=norm_points,
-                point_labels=labels,
-                obj_id=obj_id,
+            self._tracker.add_new_mask(
+                self._state, self._curr_ti, obj_id, bmask,
             )
             self._object_ids.add(obj_id)
 
@@ -161,55 +187,35 @@ class Sam3PropagationBackend:
         self._invalidate_generator()
         return self._binary_dict_to_prob(binary_masks)
 
-    @staticmethod
-    def _mask_to_points(
-        binary_mask: torch.Tensor,
-    ) -> Tuple[Optional[List[List[float]]], Optional[List[int]]]:
-        """Convert a binary mask to point prompts (centre of mass + extremes).
-
-        Returns (points, labels) where points are in *absolute* pixel
-        coordinates ``[[x, y], ...]`` and labels are all ``1`` (positive).
-        The caller is responsible for normalising to [0, 1] if needed.
-        """
-        coords = torch.nonzero(binary_mask.squeeze() > 0.5)  # (N, 2) as (row, col)
-        if len(coords) == 0:
-            return None, None
-
-        # Centre of mass
-        center = coords.float().mean(dim=0)
-        cy, cx = center[0].item(), center[1].item()
-        points = [[cx, cy]]
-        labels = [1]
-
-        # Add extremes for better coverage if mask is large enough
-        if len(coords) > 20:
-            rows, cols = coords[:, 0], coords[:, 1]
-            for r, c in [
-                (rows.min().item(), cols[rows.argmin()].item()),  # top
-                (rows.max().item(), cols[rows.argmax()].item()),  # bottom
-                (rows[cols.argmin()].item(), cols.min().item()),  # left
-                (rows[cols.argmax()].item(), cols.max().item()),  # right
-            ]:
-                points.append([float(c), float(r)])
-                labels.append(1)
-
-        return points, labels
-
     def _step_propagate(self) -> torch.Tensor:
-        """Consume the next frame from the SAM 3 propagation generator."""
+        """Consume the next frame from the tracker propagation generator."""
         if self._propagation_gen is None:
-            self._propagation_gen = self._model.propagate_in_video(
-                self._state, reverse=self._reverse,
+            self._propagation_gen = self._tracker.propagate_in_video(
+                self._state,
+                start_frame_idx=self._curr_ti,
+                max_frame_num_to_track=None,
+                reverse=self._reverse,
+                propagate_preflight=True,
             )
 
         try:
-            frame_idx, outputs = next(self._propagation_gen)
+            result = next(self._propagation_gen)
+            # Tracker yields (frame_idx, obj_ids, low_res_masks,
+            #                  video_res_masks, obj_scores)
+            frame_idx = result[0]
+            obj_ids = result[1]
+            video_res_masks = result[3]
+
             while frame_idx != self._curr_ti:
                 log.debug(
-                    "Skipping SAM 3 generator frame %d (expecting %d)",
+                    "Skipping SAM 3 tracker frame %d (expecting %d)",
                     frame_idx, self._curr_ti,
                 )
-                frame_idx, outputs = next(self._propagation_gen)
+                result = next(self._propagation_gen)
+                frame_idx = result[0]
+                obj_ids = result[1]
+                video_res_masks = result[3]
+
         except StopIteration:
             log.warning(
                 "SAM 3 propagation generator exhausted at frame %d",
@@ -221,7 +227,11 @@ class Sam3PropagationBackend:
             prob[0] = 1.0
             return prob
 
-        return self._sam3_outputs_to_prob(outputs)
+        # video_res_masks: (num_objects, 1, H, W) bool
+        mask_dict: Dict[int, torch.Tensor] = {}
+        for i, oid in enumerate(obj_ids):
+            mask_dict[int(oid)] = video_res_masks[i].squeeze(0).float()
+        return self._binary_dict_to_prob(mask_dict)
 
     # -- Text prompt support ---------------------------------------------------
 
@@ -233,13 +243,15 @@ class Sam3PropagationBackend:
     ) -> torch.Tensor:
         """Segment all instances of *text* at *frame_idx*.
 
+        Uses the full VG model (lazily initialised).
+
         Returns:
             (num_objects+1, H, W) probability tensor.
         """
-        self._ensure_state()
+        self._ensure_vg_state()
 
         frame_idx_out, outputs = self._model.add_prompt(
-            inference_state=self._state,
+            inference_state=self._vg_state,
             frame_idx=frame_idx,
             text_str=text,
         )
@@ -253,7 +265,7 @@ class Sam3PropagationBackend:
 
     def clear_memory(self) -> None:
         if self._state is not None:
-            self._model.reset_state(self._state)
+            self._tracker._reset_tracking_results(self._state)
         self._permanent_anchors.clear()
         self._all_anchors.clear()
         self._object_ids.clear()
@@ -263,7 +275,7 @@ class Sam3PropagationBackend:
 
     def clear_non_permanent_memory(self) -> None:
         if self._state is not None:
-            self._model.reset_state(self._state)
+            self._tracker._reset_tracking_results(self._state)
         self._all_anchors = dict(self._permanent_anchors)
         self._invalidate_generator()
         self._curr_ti = -1
@@ -273,18 +285,7 @@ class Sam3PropagationBackend:
                 mask.to(self._device), objects, idx_mask=True,
             )
             for obj_id, bmask in binary_masks.items():
-                points, labels = self._mask_to_points(bmask)
-                if points is None:
-                    continue
-                H, W = bmask.shape[-2:]
-                norm_points = [[p[0] / W, p[1] / H] for p in points]
-                self._model.add_prompt(
-                    inference_state=self._state,
-                    frame_idx=fi,
-                    points=norm_points,
-                    point_labels=labels,
-                    obj_id=obj_id,
-                )
+                self._tracker.add_new_mask(self._state, fi, obj_id, bmask)
 
     def clear_sensory_memory(self) -> None:
         self._invalidate_generator()
@@ -296,13 +297,20 @@ class Sam3PropagationBackend:
     def delete_objects(self, objects: List[int]) -> None:
         for oid in objects:
             self._object_ids.discard(oid)
-            if self._state is not None:
-                try:
-                    self._model.remove_object(
-                        inference_state=self._state, obj_id=oid,
-                    )
-                except (AttributeError, KeyError):
-                    pass
+            # Tracker doesn't expose remove_object; clear and re-add remaining
+        if self._state is not None and objects:
+            remaining_anchors = dict(self._all_anchors)
+            self._tracker._reset_tracking_results(self._state)
+            for fi, (mask, objs) in sorted(remaining_anchors.items()):
+                binary_masks = self._to_binary_masks(
+                    mask.to(self._device), objs, idx_mask=True,
+                )
+                for obj_id, bmask in binary_masks.items():
+                    if obj_id not in objects:
+                        self._tracker.add_new_mask(
+                            self._state, fi, obj_id, bmask,
+                        )
+            self._invalidate_generator()
 
     def output_prob_to_mask(self, output_prob: torch.Tensor) -> torch.Tensor:
         return torch.argmax(output_prob, dim=0)
@@ -326,7 +334,7 @@ class Sam3PropagationBackend:
     def _sam3_outputs_to_prob(
         self, outputs: dict,
     ) -> torch.Tensor:
-        """Convert SAM 3 output dict to (N+1, H, W) probability tensor."""
+        """Convert SAM 3 VG output dict to (N+1, H, W) probability tensor."""
         mask_dict: Dict[int, torch.Tensor] = {}
         if outputs is not None and "out_binary_masks" in outputs:
             obj_ids = outputs["out_obj_ids"]   # numpy int64 array

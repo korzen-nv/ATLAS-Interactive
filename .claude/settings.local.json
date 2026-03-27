@@ -4,5 +4,9 @@
       "Bash(xargs grep:*)",
       "Bash(find /c/Projects/ATLAS-Interactive -path *cutie/config* -name *.yaml)"
     ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true
   }
 }

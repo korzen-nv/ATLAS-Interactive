@@ -4,6 +4,8 @@ PropagationBackend and ClickBackend protocols.
 from __future__ import annotations
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -12,6 +14,106 @@ import torch
 from gui.backends.base import MemoryStatus
 
 log = logging.getLogger(__name__)
+
+
+# ── Multi-threaded frame loader ──────────────────────────────────────────────
+
+
+class _MultiThreadFrameLoader:
+    """Drop-in replacement for SAM 2's ``AsyncVideoFrameLoader`` that loads
+    JPEG frames in parallel using a :class:`~concurrent.futures.ThreadPoolExecutor`.
+
+    The original loader uses a single background thread, which means JPEG
+    decompression + resize is serialised.  PIL releases the GIL during
+    image I/O so multiple threads provide a real speed-up.
+
+    Interface is identical to ``AsyncVideoFrameLoader`` (``__getitem__`` /
+    ``__len__`` plus ``.video_height`` / ``.video_width``), so SAM 2's
+    ``init_state`` can use it transparently.
+    """
+
+    def __init__(
+        self,
+        img_paths,
+        image_size,
+        offload_video_to_cpu,
+        img_mean,
+        img_std,
+        compute_device,
+        *,
+        num_workers: Optional[int] = None,
+    ):
+        from sam2.utils.misc import _load_img_as_tensor
+
+        self.img_paths = img_paths
+        self.image_size = image_size
+        self.offload_video_to_cpu = offload_video_to_cpu
+        self.img_mean = img_mean
+        self.img_std = img_std
+        self.compute_device = compute_device
+        self.images: list = [None] * len(img_paths)
+        self.exception: Optional[Exception] = None
+        self.video_height: Optional[int] = None
+        self.video_width: Optional[int] = None
+        self._load_img = _load_img_as_tensor
+
+        if num_workers is None:
+            num_workers = min(os.cpu_count() or 4, len(img_paths), 8)
+
+        # Frame 0 must be ready before init_state returns (SAM 2 warms up
+        # the backbone on it).
+        self._load_frame(0)
+
+        # Submit the rest to the thread pool.
+        self._executor = ThreadPoolExecutor(
+            max_workers=num_workers, thread_name_prefix="sam2-frame-loader",
+        )
+        self._futures: dict = {}
+        for n in range(1, len(img_paths)):
+            self._futures[n] = self._executor.submit(self._load_frame, n)
+
+        log.info(
+            "Loading %d frames with %d worker threads", len(img_paths), num_workers,
+        )
+
+    # -- internal ----------------------------------------------------------
+
+    def _load_frame(self, index: int) -> torch.Tensor:
+        img, h, w = self._load_img(self.img_paths[index], self.image_size)
+        if self.video_height is None:
+            self.video_height = h
+            self.video_width = w
+        img -= self.img_mean
+        img /= self.img_std
+        if not self.offload_video_to_cpu:
+            img = img.to(self.compute_device, non_blocking=True)
+        self.images[index] = img
+        return img
+
+    # -- public interface (same as AsyncVideoFrameLoader) ------------------
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        if self.exception is not None:
+            raise RuntimeError("Failure in frame loading thread") from self.exception
+
+        img = self.images[index]
+        if img is not None:
+            return img
+
+        # Block until this specific frame is ready.
+        future = self._futures.get(index)
+        if future is not None:
+            try:
+                return future.result()
+            except Exception as e:
+                self.exception = e
+                raise RuntimeError("Failure in frame loading thread") from e
+
+        # Fallback: load directly (should not happen).
+        return self._load_frame(index)
+
+    def __len__(self) -> int:
+        return len(self.images)
 
 
 def _init_hydra_for_sam2() -> None:
@@ -94,11 +196,21 @@ class Sam2PropagationBackend:
                     "SAM 2 backend requires image_dir (workspace/images) "
                     "to be set before the first step()."
                 )
-            self._state = self._predictor.init_state(
-                video_path=self._image_dir,
-                offload_video_to_cpu=True,
-                offload_state_to_cpu=True,
-            )
+            # Temporarily replace SAM 2's single-thread loader with our
+            # multi-threaded version so frames are decoded in parallel.
+            import sam2.utils.misc as _sam2_misc
+
+            _orig_loader = _sam2_misc.AsyncVideoFrameLoader
+            _sam2_misc.AsyncVideoFrameLoader = _MultiThreadFrameLoader
+            try:
+                self._state = self._predictor.init_state(
+                    video_path=self._image_dir,
+                    offload_video_to_cpu=True,
+                    offload_state_to_cpu=True,
+                    async_loading_frames=True,
+                )
+            finally:
+                _sam2_misc.AsyncVideoFrameLoader = _orig_loader
             log.info(f"SAM 2 state initialised from {self._image_dir}")
 
     def _invalidate_generator(self) -> None:
@@ -169,7 +281,9 @@ class Sam2PropagationBackend:
         """
         if self._propagation_gen is None:
             self._propagation_gen = self._predictor.propagate_in_video(
-                self._state, reverse=self._reverse,
+                self._state,
+                start_frame_idx=self._curr_ti,
+                reverse=self._reverse,
             )
 
         try:

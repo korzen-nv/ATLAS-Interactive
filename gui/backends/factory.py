@@ -110,10 +110,14 @@ def _create_sam3(cfg, device, image_dir, shared_model):
         num_objects=cfg.num_objects,
         shared_model=shared_model,
     )
-    # Share the tracker from the video model for click-based interaction
-    # so we don't load the backbone twice.
+    # The tracker is built without a vision backbone (it's on the detector).
+    # SAM3InteractiveImagePredictor needs the backbone for forward_image(),
+    # so share the detector's backbone with the tracker.
+    tracker = propagation._model.tracker
+    if tracker.backbone is None:
+        tracker.backbone = propagation._model.detector.backbone
     click = Sam3ClickBackend(
-        tracker_model=propagation._model.tracker,
+        tracker_model=tracker,
         device=device,
     )
     return propagation, click
