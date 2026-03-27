@@ -399,6 +399,7 @@ class MainController():
 
     def on_propagate(self):
         # start to propagate
+        import time as _time
         with autocast(self.device, enabled=(self.amp and self.device == 'cuda')):
             self.convert_current_image_mask_torch()
 
@@ -422,25 +423,99 @@ class MainController():
             dataset = PropagationReader(self.res_man, self.curr_ti, self.propagate_direction)
             loader = get_data_loader(dataset, self.cfg.num_read_workers)
 
+            # profiling accumulators
+            _prof_data_load = 0.0
+            _prof_transfer = 0.0
+            _prof_nav = 0.0
+            _prof_model = 0.0
+            _prof_postproc = 0.0
+            _prof_save = 0.0
+            _prof_display = 0.0
+            _prof_gauges = 0.0
+            _prof_events = 0.0
+            _prof_total_start = _time.perf_counter()
+            _prof_n = 0
+
             # propagate till the end
+            _t0 = _time.perf_counter()
             for data in loader:
+                _t1 = _time.perf_counter()
+                _prof_data_load += _t1 - _t0
+
                 if not self.propagating:
                     break
+
                 self.curr_image_np, self.curr_image_torch = data
+                _t2 = _time.perf_counter()
                 self.curr_image_torch = self.curr_image_torch.to(self.device, non_blocking=True)
+                if 'cuda' in self.device:
+                    torch.cuda.synchronize()
+                _t3 = _time.perf_counter()
+                _prof_transfer += _t3 - _t2
+
                 self.propagate_fn()
+                _t4 = _time.perf_counter()
+                _prof_nav += _t4 - _t3
 
                 self.curr_prob = self.processor.step(self.curr_image_torch)
+                if 'cuda' in self.device:
+                    torch.cuda.synchronize()
+                _t5 = _time.perf_counter()
+                _prof_model += _t5 - _t4
+
                 self.curr_mask = torch_prob_to_numpy_mask(self.curr_prob)
+                _t6 = _time.perf_counter()
+                _prof_postproc += _t6 - _t5
 
                 self.save_current_mask()
+                _t7 = _time.perf_counter()
+                _prof_save += _t7 - _t6
+
                 self.show_current_frame(fast=True)
+                _t8 = _time.perf_counter()
+                _prof_display += _t8 - _t7
 
                 self.update_memory_gauges()
+                _t9 = _time.perf_counter()
+                _prof_gauges += _t9 - _t8
+
                 self.gui.process_events()
+                _t0 = _time.perf_counter()
+                _prof_events += _t0 - _t9
+
+                _prof_n += 1
 
                 if self.curr_ti == 0 or self.curr_ti == self.T - 1:
                     break
+
+            _prof_total = _time.perf_counter() - _prof_total_start
+
+            # Print profiling summary
+            if _prof_n > 0:
+                print(f"\n{'='*80}")
+                print(f"  PROPAGATION PROFILING  ({_prof_n} frames, "
+                      f"{_prof_total:.2f}s total, "
+                      f"{_prof_n/_prof_total:.1f} fps)")
+                print(f"{'='*80}")
+                print(f"  {'Component':<25} {'Total (s)':>10} {'Per frame (ms)':>15} {'% of total':>12}")
+                print(f"  {'-'*62}")
+                for name, val in [
+                    ('Data loading',     _prof_data_load),
+                    ('GPU transfer',     _prof_transfer),
+                    ('Navigation',       _prof_nav),
+                    ('Model inference',  _prof_model),
+                    ('Postprocessing',   _prof_postproc),
+                    ('Mask saving',      _prof_save),
+                    ('Display update',   _prof_display),
+                    ('Memory gauges',    _prof_gauges),
+                    ('GUI events',       _prof_events),
+                ]:
+                    print(f"  {name:<25} {val:>10.3f} {val/_prof_n*1000:>15.2f} {val/_prof_total*100:>11.1f}%")
+                accounted = (_prof_data_load + _prof_transfer + _prof_nav + _prof_model +
+                             _prof_postproc + _prof_save + _prof_display + _prof_gauges + _prof_events)
+                overhead = _prof_total - accounted
+                print(f"  {'Unaccounted':<25} {overhead:>10.3f} {overhead/_prof_n*1000:>15.2f} {overhead/_prof_total*100:>11.1f}%")
+                print(f"{'='*80}\n")
 
             self.propagating = False
             self.curr_frame_dirty = False
