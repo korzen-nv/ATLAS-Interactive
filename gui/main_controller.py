@@ -137,9 +137,19 @@ class MainController():
 
     def initialize_networks(self) -> None:
         download_models_if_needed()
+
+        # Enable inference-time CUDA optimizations
+        if 'cuda' in self.device:
+            torch.backends.cudnn.benchmark = True
+            torch.set_float32_matmul_precision('high')  # enable TF32 on Ampere+
+
         self.cutie = CUTIE(self.cfg).eval().to(self.device)
         model_weights = torch.load(self.cfg.weights, map_location=self.device)
         self.cutie.load_weights(model_weights)
+
+        # channels_last memory format is faster for conv-heavy models on CUDA
+        if 'cuda' in self.device:
+            self.cutie = self.cutie.to(memory_format=torch.channels_last)
 
         self.click_ctrl = ClickController(self.cfg.ritm_weights, device=self.device)
 
@@ -399,6 +409,7 @@ class MainController():
 
     def on_propagate(self):
         # start to propagate
+        import time
         with autocast(self.device, enabled=(self.amp and self.device == 'cuda')):
             self.convert_current_image_mask_torch()
 
@@ -423,6 +434,8 @@ class MainController():
             loader = get_data_loader(dataset, self.cfg.num_read_workers)
 
             # propagate till the end
+            frames_done = 0
+            t_start = time.monotonic()
             for data in loader:
                 if not self.propagating:
                     break
@@ -436,11 +449,16 @@ class MainController():
                 self.save_current_mask()
                 self.show_current_frame(fast=True)
 
+                frames_done += 1
                 self.update_memory_gauges()
                 self.gui.process_events()
 
                 if self.curr_ti == 0 or self.curr_ti == self.T - 1:
                     break
+
+            elapsed = time.monotonic() - t_start
+            fps = frames_done / elapsed if elapsed > 0 else 0
+            self.gui.fps_label.setText(f'Propagate: {fps:.1f} fps ({frames_done} frames)')
 
             self.propagating = False
             self.curr_frame_dirty = False

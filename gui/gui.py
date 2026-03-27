@@ -57,6 +57,10 @@ class GUI(QWidget):
         self.progressbar.setValue(0)
         self.progressbar.setMinimumWidth(200)
 
+        # propagation FPS label
+        self.fps_label = QLabel('')
+        self.fps_label.setMinimumWidth(180)
+
         self.reset_frame_button = QPushButton('Reset frame')
         self.reset_frame_button.clicked.connect(controller.on_reset_mask)
         self.reset_object_button = QPushButton('Reset object')
@@ -227,6 +231,7 @@ class GUI(QWidget):
         control_topbox.addWidget(self.forward_run_button)
         control_topbox.addWidget(self.backward_run_button)
         control_botbox.addWidget(self.progressbar)
+        control_botbox.addWidget(self.fps_label)
         control_subbox.addLayout(control_topbox)
         control_subbox.addLayout(control_botbox)
         navi.addLayout(control_subbox)

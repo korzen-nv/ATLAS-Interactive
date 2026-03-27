@@ -231,6 +231,8 @@ class InferenceCore:
 
         image, self.pad = pad_divide_by(image, 16)
         image = image.unsqueeze(0)  # add the batch dimension
+        if image.is_cuda:
+            image = image.to(memory_format=torch.channels_last)
         if self.flip_aug:
             image = torch.cat([image, torch.flip(image, dims=[-1])], dim=0)
 
