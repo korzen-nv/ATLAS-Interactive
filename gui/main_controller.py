@@ -18,7 +18,7 @@ from torchvision.transforms.functional import to_tensor
 import numpy as np
 from omegaconf import DictConfig, open_dict
 
-from gui.backends.factory import create_backends
+from gui.backends.factory import create_auto_segmenter, create_backends
 
 from gui.interaction import *
 from gui.interactive_utils import *
@@ -142,6 +142,7 @@ class MainController():
         self._propagation, self.click_ctrl = create_backends(
             self.cfg, self.device, image_dir=self.res_man.image_dir,
         )
+        self._auto_seg = None  # lazy-loaded on first use
 
     def hit_number_key(self, number: int):
         if number == self.curr_object:
@@ -742,6 +743,45 @@ class MainController():
             self.show_current_frame()
         except FileNotFoundError:
             self.gui.text(f'{file_name} not found.')
+
+    def on_auto_segment(self):
+        """Run SurgNetXL auto-segmentation on the current frame."""
+        if self.propagating:
+            return
+
+        # Lazy-load the auto-seg model on first use
+        if self._auto_seg is None:
+            self.gui.text('Loading SurgNetXL seg head...')
+            self.gui.process_events()
+            self._auto_seg = create_auto_segmenter(self.cfg, self.device)
+            if self._auto_seg is None:
+                self.gui.text('Auto-seg not configured (set autoseg_weights in config).')
+                return
+
+        self.gui.text(f'Auto-segmenting frame {self.curr_ti}...')
+        self.gui.process_events()
+
+        # Run inference on the current frame
+        seg_mask = self._auto_seg.segment(self.curr_image_np)
+
+        # Validate
+        if seg_mask.max() > self.num_objects:
+            self.gui.text(
+                f'Auto-seg produced class {seg_mask.max()} but num_objects={self.num_objects}. '
+                f'Check autoseg_class_map in config.'
+            )
+            return
+
+        # Snapshot for undo, then apply
+        self._snapshot_mask()
+        self.curr_mask = seg_mask
+        self.curr_prob = index_numpy_to_one_hot_torch(
+            self.curr_mask, self.num_objects + 1
+        ).to(self.device)
+
+        self.save_current_mask()
+        self.show_current_frame()
+        self.gui.text(f'Auto-segmented frame {self.curr_ti}.')
 
     def on_save_soft_mask_toggle(self):
         self.save_soft_mask = self.gui.save_soft_mask_checkbox.isChecked()

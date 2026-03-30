@@ -113,18 +113,18 @@ custom_names = {
 ### CholecSeg + HeiSurf + Endoscapes Merged Palette ###
 color_palette = {
     1: (150, 100, 50),   # Liver - Brown
-    2: (255, 150, 50),   # Liver ligament - Orange
-    3: (200, 150, 100),  # Abdominal wall - Beige
-    4: (0, 255, 0),      # GI Tract - Green
-    5: (255, 255, 0),    # Fat - Yellow
-    6: (255, 0, 0),      # Blood - Red
-    7: (0, 200, 255),    # Gallbladder - Teal
-    8: (255, 220, 200),  # Gallbladder Resection Bed / Connective tissue / Cystic plate - Light Pink
+    2: (200, 150, 100),  # Abdominal wall - Beige
+    3: (0, 255, 0),      # GI Tract - Green
+    4: (255, 255, 0),    # Fat - Yellow
+    5: (255, 0, 0),      # Blood - Red
+    6: (0, 200, 255),    # Gallbladder - Teal
+    7: (255, 105, 180),  # Gallbladder Resection Bed / Connective tissue / Cystic plate - Light Pink 
+    8: (255, 255, 255),  # Coagulated tissue - White
     9: (0, 255, 255),    # Cystic duct - Cyan
     10: (180, 0, 0),     # Cystic artery - Dark Red
-    11: (255, 255, 255), # Monopolar hook - White
-    12: (200, 100, 255), # Grasper - Lavender
-    13: (255, 0, 150),   # Clip - Pink
+    11: (0, 0, 255),    # Monopolar hook - Blue
+    12: (0, 0, 180),    # Grasper - Dark Blue
+    13: (255, 150, 50),   # Liver ligament - Orange
     14: (200, 0, 200),   # Other instrument - Purple
     15: (50, 50, 50),    # Other structure - Dark Gray
     16: (0, 0, 0),       # Background - Black
@@ -132,19 +132,19 @@ color_palette = {
 
 custom_names = {
     1: "Liver",
-    2: "Liver ligament",
-    3: "Abdominal wall",
-    4: "GI Tract",
-    5: "Fat",
-    6: "Blood",
-    7: "Gallbladder",
-    8: "Gallbladder Resection Bed / Connective tissue / Cystic plate",  #burned tissue after resection
+    2: "Abdominal wall",
+    3: "GI Tract",
+    4: "Fat",
+    5: "Blood",
+    6: "Gallbladder",
+    7: "Gallbladder Resection Bed / Connective tissue",  #damaged tissue after resection
+    8: "Coagulated tissue",  #damaged tissue after resection
     9: "Cystic duct",
     10: "Cystic artery",
     11: "Monopolar hook",
     12: "Grasper",
-    13: "Clip",
-    14: "Other instrument",
+    13: "Liver ligament",
+    14: "Other instrument / Clip",
     15: "Other structure",
     16: "Background",
 }

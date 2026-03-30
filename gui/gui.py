@@ -161,6 +161,10 @@ class GUI(QWidget):
         self.import_layer_button = QPushButton('Import layer')
         self.import_layer_button.clicked.connect(controller.on_import_layer)
 
+        # auto-segment (SurgNetXL)
+        self.auto_seg_button = QPushButton('Auto-segment (A)')
+        self.auto_seg_button.clicked.connect(controller.on_auto_segment)
+
         # Console on the GUI
         self.console = QPlainTextEdit()
         self.console.setReadOnly(True)
@@ -259,6 +263,7 @@ class GUI(QWidget):
         import_area.setAlignment(Qt.AlignmentFlag.AlignBottom)
         import_area.addWidget(self.import_mask_button)
         import_area.addWidget(self.import_layer_button)
+        import_area.addWidget(self.auto_seg_button)
         right_area.addLayout(import_area)
 
         # console
@@ -317,6 +322,9 @@ class GUI(QWidget):
         
         # Toggle visualization mode
         QShortcut(QKeySequence(Qt.Key.Key_T), self).activated.connect(controller.on_toggle_vis_mode)
+
+        # auto-segment current frame
+        QShortcut(QKeySequence(Qt.Key.Key_A), self).activated.connect(controller.on_auto_segment)
 
         # undo last mask edit
         QShortcut(QKeySequence(Qt.Key.Key_Z | Qt.KeyboardModifier.ControlModifier),

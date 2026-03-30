@@ -12,6 +12,26 @@ from gui.backends.base import ClickBackend, PropagationBackend
 log = logging.getLogger(__name__)
 
 
+def create_auto_segmenter(cfg: DictConfig, device: str):
+    """Create the SurgNetXL auto-segmentation backend if configured.
+
+    Returns ``None`` when ``autoseg_weights`` is not set in config.
+    """
+    weights = cfg.get('autoseg_weights')
+    if not weights:
+        return None
+
+    from gui.backends.surgnet_seg import SurgNetSegBackend
+
+    # Build class map from config (list of "src:dst" ints) if provided
+    class_map = None
+    raw_map = cfg.get('autoseg_class_map')
+    if raw_map:
+        class_map = {int(k): int(v) for k, v in raw_map.items()}
+
+    return SurgNetSegBackend(checkpoint=weights, device=device, class_map=class_map)
+
+
 def create_backends(
     cfg: DictConfig,
     device: str,

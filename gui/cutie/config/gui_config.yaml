@@ -13,7 +13,7 @@ mask_endpoint: masks
 vis_endpoint: vis
 
 # Backend selection: cutie | sam2 | sam3 | sam31
-backend: sam31
+backend: cutie
 
 amp: True
 weights: gui/weights/cutie-surgenetseg-50k.pth
@@ -39,6 +39,22 @@ sam3_bpe_path: null
 
 # SAM 3.1 config (only used when backend: sam31)
 sam31_weights: gui/weights/sam3.1_multiplex.pt
+
+# Auto-segmentation (SurgNetXL seg head) — press 'A' to auto-segment current frame
+# Set autoseg_weights to null or remove to disable
+autoseg_weights: /home/pkorzeniowsk/Projects/surgnet/SurgNetXL Seg Head/seg_head_8class.pth
+# Mapping from SurgNetXL class IDs (0-7) to ATLAS palette object IDs.
+# SurgNetXL classes: 0=BG, 1=Abdominal Wall, 2=Liver, 3=Gallbladder,
+#                    4=Fat, 5=Connective Tissue, 6=Instruments, 7=Other Anatomy
+autoseg_class_map:
+  0: 0    # Background   → background
+  1: 3    # Abdominal Wall → Abdominal wall
+  2: 1    # Liver         → Liver
+  3: 7    # Gallbladder   → Gallbladder
+  4: 5    # Fat           → Fat
+  5: 8    # Connective T. → Connective tissue / Cystic plate
+  6: 11   # Instruments   → Monopolar hook (first instrument slot)
+  7: 15   # Other Anatomy → Other structure
 
 # All "size" parameters represent the length of the shorter edge
 # maximum internal processing size; reducing this speeds up processing
