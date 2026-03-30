@@ -13,7 +13,15 @@
       "Bash(uv sync:*)",
       "Bash(pip show:*)",
       "Bash(uv pip:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(grep -E \"\\\\.py$|^d\")",
+      "Bash(grep -r \"multiplex\\\\|3\\\\.1\" /home/pkorzeniowsk/Projects/sam3/sam3/sam3/*.py)",
+      "Bash(xargs -I {} basename {})",
+      "Bash(python:*)",
+      "Bash(uv run:*)",
+      "Bash(file /home/pkorzeniowsk/Projects/surgnet/SurgNetXL Seg Head/*.pth)",
+      "Bash(python3:*)",
+      "Bash(find /home/pkorzeniowsk/Projects -path *surgnet* -name *.py -type f)"
     ]
   },
   "sandbox": {

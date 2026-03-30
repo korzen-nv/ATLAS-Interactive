@@ -12,8 +12,8 @@ image_endpoint: images
 mask_endpoint: masks
 vis_endpoint: vis
 
-# Backend selection: cutie | sam2 | sam3
-backend: sam3
+# Backend selection: cutie | sam2 | sam3 | sam31
+backend: sam31
 
 amp: True
 weights: gui/weights/cutie-surgenetseg-50k.pth
@@ -36,6 +36,9 @@ sam2_model_cfg: sam2.1/sam2.1_hiera_b+.yaml
 sam3_weights: gui/weights/sam3_sean_merged.pt
 sam3_model_cfg: null
 sam3_bpe_path: null
+
+# SAM 3.1 config (only used when backend: sam31)
+sam31_weights: gui/weights/sam3.1_multiplex.pt
 
 # All "size" parameters represent the length of the shorter edge
 # maximum internal processing size; reducing this speeds up processing

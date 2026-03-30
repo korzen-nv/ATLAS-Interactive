@@ -40,10 +40,12 @@ def create_backends(
         return _create_sam2(cfg, device, image_dir, shared_model)
     elif backend_name == 'sam3':
         return _create_sam3(cfg, device, image_dir, shared_model)
+    elif backend_name == 'sam31':
+        return _create_sam31(cfg, device, image_dir, shared_model)
     else:
         raise ValueError(
             f"Unknown backend '{backend_name}'. "
-            f"Expected one of: cutie, sam2, sam3"
+            f"Expected one of: cutie, sam2, sam3, sam31"
         )
 
 
@@ -118,6 +120,27 @@ def _create_sam3(cfg, device, image_dir, shared_model):
         tracker.backbone = propagation._model.detector.backbone
     click = Sam3ClickBackend(
         tracker_model=tracker,
+        device=device,
+    )
+    return propagation, click
+
+
+# -- SAM 3.1 (Multiplex) ------------------------------------------------------
+
+def _create_sam31(cfg, device, image_dir, shared_model):
+    from gui.backends.sam31_backend import Sam31ClickBackend, Sam31PropagationBackend
+
+    checkpoint = cfg.get('sam31_weights')  # None → auto-download from HF
+
+    propagation = Sam31PropagationBackend(
+        checkpoint=checkpoint,
+        device=device,
+        image_dir=image_dir,
+        num_objects=cfg.num_objects,
+        shared_model=shared_model,
+    )
+    click = Sam31ClickBackend(
+        multiplex_model=propagation._model,
         device=device,
     )
     return propagation, click
