@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from gui.backends.base import MemoryStatus
 
@@ -429,6 +430,7 @@ class Sam2ClickBackend:
         self._anchored = False
         self._points: List[List[int]] = []
         self._labels: List[int] = []
+        self._logits: Optional[np.ndarray] = None
 
     @staticmethod
     def _build_image_predictor(checkpoint, model_cfg, device):
@@ -442,6 +444,16 @@ class Sam2ClickBackend:
     def _wrap_image_predictor(model):
         from sam2.sam2_image_predictor import SAM2ImagePredictor
         return SAM2ImagePredictor(model)
+
+    def _prev_mask_to_logits(self, prev_mask: torch.Tensor) -> np.ndarray:
+        """Convert (1, 1, H, W) probability mask to low-res logits for SAM."""
+        mask_size = self._predictor.model.sam_prompt_encoder.mask_input_size
+        pm = prev_mask.squeeze(0).float()  # (1, H, W)
+        pm = F.interpolate(pm.unsqueeze(0), size=mask_size,
+                           mode='bilinear', align_corners=False)
+        pm = pm.squeeze(0).cpu().numpy()   # (1, mask_H, mask_W)
+        pm = np.clip(pm, 1e-6, 1 - 1e-6)
+        return np.log(pm / (1 - pm))       # logit transform
 
     def interact(
         self,
@@ -461,16 +473,28 @@ class Sam2ClickBackend:
             self._predictor.set_image(img_np)
             self._points = []
             self._labels = []
+            self._logits = None
             self._anchored = True
 
         self._points.append([x, y])
         self._labels.append(1 if is_positive else 0)
 
+        # Build mask_input: use stored logits from previous click,
+        # or convert prev_mask on first click to seed refinement
+        mask_input = None
+        if self._logits is not None:
+            mask_input = self._logits
+        elif prev_mask is not None:
+            mask_input = self._prev_mask_to_logits(prev_mask)
+
         masks, scores, logits = self._predictor.predict(
             point_coords=np.array(self._points),
             point_labels=np.array(self._labels),
+            mask_input=mask_input,
             multimask_output=False,
         )
+        self._logits = logits
+
         # masks: (1, H, W) bool → (1, 1, H, W) float
         return (
             torch.from_numpy(masks[0:1])
@@ -483,6 +507,7 @@ class Sam2ClickBackend:
         self._anchored = False
         self._points = []
         self._labels = []
+        self._logits = None
 
     def undo(self) -> Optional[torch.Tensor]:
         if not self._points:
@@ -490,12 +515,15 @@ class Sam2ClickBackend:
         self._points.pop()
         self._labels.pop()
         if not self._points:
+            self._logits = None
             return None
-        masks, _, _ = self._predictor.predict(
+        masks, _, logits = self._predictor.predict(
             point_coords=np.array(self._points),
             point_labels=np.array(self._labels),
+            mask_input=self._logits,
             multimask_output=False,
         )
+        self._logits = logits
         return (
             torch.from_numpy(masks[0:1])
             .float()

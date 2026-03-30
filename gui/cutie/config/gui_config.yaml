@@ -33,7 +33,7 @@ sam2_model_cfg: sam2.1/sam2.1_hiera_b+.yaml
 # Set sam3_weights to null to auto-download from HuggingFace (facebook/sam3)
 # Or provide a path to a local sam3.pt checkpoint
 #sam3_weights: gui/weights/sam3_sean_merged.pt
-sam3_weights: gui/weights/sam3.pt
+sam3_weights: gui/weights/sam3_sean_merged.pt
 sam3_model_cfg: null
 sam3_bpe_path: null
 

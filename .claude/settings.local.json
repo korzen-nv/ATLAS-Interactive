@@ -2,11 +2,22 @@
   "permissions": {
     "allow": [
       "Bash(xargs grep:*)",
-      "Bash(find /c/Projects/ATLAS-Interactive -path *cutie/config* -name *.yaml)"
+      "Bash(find /c/Projects/ATLAS-Interactive -path *cutie/config* -name *.yaml)",
+      "WebFetch(domain:chatgpt.com)",
+      "WebFetch(domain:ab.chatgpt.com)",
+      "Bash(codex exec:*)",
+      "Bash(find /home/pkorzeniowsk/Projects/atlas/ATLAS-Interactive -type f -name *sam*)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\(''gui/backends/sam2_backend.py''\\).read\\(\\)\\); print\\(''sam2_backend.py: OK''\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\(''gui/backends/sam3_backend.py''\\).read\\(\\)\\); print\\(''sam3_backend.py: OK''\\)\")",
+      "Bash(pip install:*)",
+      "Bash(uv sync:*)",
+      "Bash(pip show:*)",
+      "Bash(uv pip:*)",
+      "Bash(ls:*)"
     ]
   },
   "sandbox": {
-    "enabled": true,
-    "autoAllowBashIfSandboxed": true
+    "enabled": false,
+    "autoAllowBashIfSandboxed": false
   }
 }

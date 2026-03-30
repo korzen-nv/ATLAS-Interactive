@@ -16,7 +16,7 @@ version = "1.0.0"
 authors = [{ name = "Ronald L.P.D. de Jong", email = "r.l.p.d.d.jong@tue.nl" }, {name = "Tim J.M. Jaspers", email = "t.j.m.jaspers@tue.nl"}]
 description = ""
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 classifiers = [
   "Programming Language :: Python :: 3",
   "Operating System :: OS Independent",
@@ -46,6 +46,10 @@ dependencies = [
   'pyqtdarktheme',
   'sam2',
   'sam3 @ file:///home/pkorzeniowsk/Projects/sam3/sam3',
+  'cc-torch @ git+https://github.com/ronghanghu/cc_torch.git@446e9360ed10d3c8d03925ccb5f220ccb62009de',
+  'flash-attn-3 == 3.0.0; sys_platform == "linux"',
+  'ninja >= 1.13.0',
+  'psutil >= 7.2.2',
 ]
 
 [project.optional-dependencies]
@@ -59,6 +63,10 @@ sam2 = [
 sam3 = [
   'sam3 @ file:///home/pkorzeniowsk/Projects/sam3/sam3',
 ]
+
+[tool.uv]
+extra-index-url = ["https://download.pytorch.org/whl/cu128"]
+index-strategy = "unsafe-best-match"
 
 [tool.hatch.build.targets.wheel]
 packages = ["SurgeNetSeg"]
