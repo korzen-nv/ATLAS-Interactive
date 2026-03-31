@@ -27,6 +27,7 @@ from gui.interactive_utils import *
 from gui.resource_manager import ResourceManager
 from gui.gui import GUI
 from gui.reader import PropagationReader, get_data_loader
+from gui.change_detector import detect_change_points
 from gui.exporter import convert_frames_to_video, convert_mask_to_binary
 from gui.global_memory import GlobalMemoryStore
 
@@ -100,6 +101,12 @@ class MainController():
 
         # track which frames have been committed to permanent memory
         self.permanent_memory_frames: set[int] = set()
+
+        # change point detection state
+        self.change_markers: set[int] = set()
+        self._detecting_changes: bool = False
+        self._change_heatmaps: dict[int, np.ndarray] = {}
+        self._show_change_heatmap: bool = False
 
         # visualization info
         self.vis_mode: str = 'davis'
@@ -335,6 +342,24 @@ class MainController():
     def compose_current_im(self):
         self.vis_image = get_visualization(self.vis_mode, self.curr_image_np, self.curr_mask,
                                            self.overlay_layer, self.vis_target_objects)
+        if self._show_change_heatmap and self.curr_ti in self._change_heatmaps:
+            self.vis_image = self._apply_change_heatmap(self.vis_image)
+
+    def _apply_change_heatmap(self, image: np.ndarray) -> np.ndarray:
+        dist_map = self._change_heatmaps[self.curr_ti]  # (16, 16) float
+        h, w = image.shape[:2]
+        upsampled = cv2.resize(dist_map, (w, h), interpolation=cv2.INTER_LINEAR)
+        # normalize to [0, 1]
+        mn, mx = upsampled.min(), upsampled.max()
+        if mx - mn > 1e-8:
+            upsampled = (upsampled - mn) / (mx - mn)
+        else:
+            upsampled = np.zeros_like(upsampled)
+        # smooth for nicer visualization
+        ksize = max(h, w) // 30
+        ksize = ksize + 1 if ksize % 2 == 0 else ksize
+        upsampled = cv2.GaussianBlur(upsampled, (ksize, ksize), 0)
+        return overlay_change_heatmap(image, upsampled)
 
     def update_canvas(self):
         self.gui.set_canvas(self.vis_image)
@@ -733,6 +758,87 @@ class MainController():
         if before:
             self.gui.tl_slider.setValue(before[0])
 
+    # ── change point detection ──────────────────────────────────────────────
+
+    def on_detect_changes(self):
+        if self.propagating:
+            return
+        # toggle: if already detecting, cancel
+        if self._detecting_changes:
+            self._detecting_changes = False
+            return
+
+        subsample = self.cfg.get('change_detect_subsample', 1)
+        sigma = self.cfg.get('change_detect_sigma', 2.0)
+        input_size = self.cfg.get('change_detect_input_size', 256)
+        sensitivity = self.gui.change_sensitivity.value()
+        # log-scale: 0→1.0, 50→0.1, 100→0.01, 150→0.001, 200→0.0001
+        prominence = 10.0 ** (-sensitivity / 50.0)
+        distance = max(1, 10 // subsample)
+
+        self._detecting_changes = True
+        self.gui.detect_changes_button.setText('Cancel (H)')
+        self.gui.text('Running change detection...')
+
+        try:
+            change_frames, spatial_maps = detect_change_points(
+                res_man=self.res_man,
+                total_frames=self.T,
+                device=self.device,
+                subsample=subsample,
+                input_size=input_size,
+                sigma=sigma,
+                prominence=prominence,
+                distance=distance,
+                progress_callback=self._change_detect_progress,
+                cancel_check=lambda: not self._detecting_changes,
+            )
+            self.change_markers = set(change_frames)
+            self._change_heatmaps = spatial_maps
+            self.gui.tl_slider.set_change_markers(self.change_markers)
+            self.gui.text(f'Found {len(change_frames)} change points.')
+        except Exception as e:
+            self.gui.text(f'Change detection failed: {e}')
+            log.exception("Change detection failed")
+        finally:
+            self._detecting_changes = False
+            self.gui.detect_changes_button.setText('Detect Changes (H)')
+            self.gui.progressbar_update(0)
+            self.update_gpu_gauges()
+
+    def _change_detect_progress(self, progress: float):
+        self.gui.progressbar_update(progress)
+        self.gui.process_events()
+
+    def on_next_change_marker(self):
+        after = sorted(i for i in self.change_markers if i > self.curr_ti)
+        if after:
+            self.gui.tl_slider.setValue(after[0])
+
+    def on_prev_change_marker(self):
+        before = sorted((i for i in self.change_markers if i < self.curr_ti), reverse=True)
+        if before:
+            self.gui.tl_slider.setValue(before[0])
+
+    def on_clear_change_markers(self):
+        self.change_markers.clear()
+        self._change_heatmaps.clear()
+        self._show_change_heatmap = False
+        self.gui.tl_slider.set_change_markers(self.change_markers)
+        self.show_current_frame()
+        self.gui.text('Change markers cleared.')
+
+    def on_toggle_change_heatmap(self):
+        self._show_change_heatmap = not self._show_change_heatmap
+        self.show_current_frame()
+        state = 'ON' if self._show_change_heatmap else 'OFF'
+        self.gui.text(f'Change heatmap {state}')
+
+    def on_change_sensitivity_update(self):
+        if not hasattr(self, 'initialized') or not self.initialized:
+            return
+        self.gui.text(f'Change sensitivity set to {self.gui.change_sensitivity.value()}%')
+
     def update_gpu_gauges(self):
         if 'cuda' in self.device:
             try:
@@ -817,6 +923,10 @@ class MainController():
         self.processor.clear_memory()
         self.permanent_memory_frames.clear()
         self.gui.tl_slider.set_markers(self.permanent_memory_frames)
+        self.change_markers.clear()
+        self._change_heatmaps.clear()
+        self._show_change_heatmap = False
+        self.gui.tl_slider.set_change_markers(self.change_markers)
         if 'cuda' in self.device:
             torch.cuda.empty_cache()
         elif 'mps' in self.device:

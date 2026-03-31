@@ -107,6 +107,29 @@ def get_visualization_torch(mode: Literal['image', 'mask', 'fade', 'davis', 'lig
         raise NotImplementedError
 
 
+def overlay_change_heatmap(image: np.ndarray, heatmap: np.ndarray,
+                           alpha: float = 0.5) -> np.ndarray:
+    """Blend a spatial change heatmap onto an RGB image.
+
+    Args:
+        image: (H, W, 3) uint8 RGB image.
+        heatmap: (H, W) float [0, 1] normalized distance map.
+        alpha: Maximum blending strength for hottest regions.
+
+    Returns:
+        (H, W, 3) uint8 composited image with warm-color overlay.
+    """
+    # hot colormap: black → red → yellow → white
+    r = np.clip(heatmap * 3, 0, 1)
+    g = np.clip(heatmap * 3 - 1, 0, 1)
+    b = np.clip(heatmap * 3 - 2, 0, 1)
+    color = np.stack([r, g, b], axis=-1) * 255  # (H, W, 3)
+
+    blend = (heatmap * alpha)[:, :, np.newaxis]  # per-pixel blend weight
+    result = image * (1 - blend) + color * blend
+    return result.clip(0, 255).astype(np.uint8)
+
+
 def overlay_davis(image: np.ndarray, mask: np.ndarray, alpha: float = 0.5, fade: bool = False):
     """ Overlay segmentation on top of RGB image. from davis official"""
     im_overlay = image.copy()

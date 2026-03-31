@@ -10,8 +10,8 @@ from PySide6.QtWidgets import (QWidget, QComboBox, QCheckBox, QHBoxLayout, QLabe
                                QListWidget, QListWidgetItem)
 
 from PySide6.QtGui import (QKeySequence, QShortcut, QTextCursor, QImage, QPixmap, QIcon, QPainter,
-                            QColor)
-from PySide6.QtCore import Qt, QTimer, QSize, QKeyCombination
+                            QColor, QPolygonF)
+from PySide6.QtCore import Qt, QTimer, QSize, QKeyCombination, QPointF
 
 from gui.cutie.utils.palette import custom_palette_np, custom_names
 from gui.gui_utils import *
@@ -24,6 +24,8 @@ class MarkerSlider(QSlider):
     HANDLE_W = 8
     MARKER_R = 4
     MARKER_R_HIGHLIGHT = 6
+    CHANGE_R = 3
+    CHANGE_R_HIGHLIGHT = 5
     HIT_RADIUS = 8  # px tolerance for hover/click detection
 
     def __init__(self, *args, **kwargs):
@@ -31,11 +33,22 @@ class MarkerSlider(QSlider):
         self._markers: set[int] = set()
         self._marker_color = QColor(0, 200, 255)
         self._marker_active_color = QColor(255, 255, 100)
+        self._change_markers: set[int] = set()
+        self._change_color = QColor(255, 160, 0)
+        self._change_active_color = QColor(255, 200, 100)
         self._hovered_idx: int | None = None
         self.setMouseTracking(True)
 
     def set_markers(self, frame_indices: set[int]):
         self._markers = set(frame_indices)
+        self.update()
+
+    def set_change_markers(self, frame_indices: set[int]):
+        self._change_markers = set(frame_indices)
+        self.update()
+
+    def clear_change_markers(self):
+        self._change_markers.clear()
         self.update()
 
     def _groove_params(self):
@@ -52,7 +65,7 @@ class MarkerSlider(QSlider):
 
     def _x_to_nearest_marker(self, x):
         best_idx, best_dist = None, self.HIT_RADIUS + 1
-        for idx in self._markers:
+        for idx in self._markers | self._change_markers:
             mx = self._idx_to_x(idx)
             if mx is None:
                 continue
@@ -76,8 +89,8 @@ class MarkerSlider(QSlider):
         super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        # if clicking on a marker, jump to that frame
-        if event.button() == Qt.MouseButton.LeftButton and self._markers:
+        # if clicking on a marker (permanent or change), jump to that frame
+        if event.button() == Qt.MouseButton.LeftButton and (self._markers or self._change_markers):
             clicked = self._x_to_nearest_marker(event.position().x())
             if clicked is not None:
                 self.setValue(clicked)
@@ -86,7 +99,7 @@ class MarkerSlider(QSlider):
 
     def paintEvent(self, event):
         super().paintEvent(event)
-        if not self._markers:
+        if not self._markers and not self._change_markers:
             return
 
         painter = QPainter(self)
@@ -95,15 +108,32 @@ class MarkerSlider(QSlider):
         groove_y = self.height() // 2
         current_val = self.value()
 
+        # draw change markers first (below permanent markers)
+        for idx in self._change_markers:
+            mx = self._idx_to_x(idx)
+            if mx is None:
+                continue
+            active = (idx == self._hovered_idx or idx == current_val)
+            r = self.CHANGE_R_HIGHLIGHT if active else self.CHANGE_R
+            color = self._change_active_color if active else self._change_color
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            diamond = QPolygonF([
+                QPointF(mx, groove_y - r),
+                QPointF(mx + r, groove_y),
+                QPointF(mx, groove_y + r),
+                QPointF(mx - r, groove_y),
+            ])
+            painter.drawPolygon(diamond)
+
+        # draw permanent memory markers on top (circles)
         for idx in self._markers:
             mx = self._idx_to_x(idx)
             if mx is None:
                 continue
-
             active = (idx == self._hovered_idx or idx == current_val)
             r = self.MARKER_R_HIGHLIGHT if active else self.MARKER_R
             color = self._marker_active_color if active else self._marker_color
-
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(color)
             painter.drawEllipse(int(mx) - r, groove_y - r, r * 2, r * 2)
@@ -271,6 +301,14 @@ class GUI(QWidget):
         self.auto_seg_button = QPushButton('Auto-segment (A)')
         self.auto_seg_button.clicked.connect(controller.on_auto_segment)
 
+        # change point detection (SurgeNetXL embeddings)
+        self.detect_changes_button = QPushButton('Detect Changes (H)')
+        self.detect_changes_button.clicked.connect(controller.on_detect_changes)
+        self.change_sensitivity, self.change_sensitivity_layout = create_parameter_box(
+            1, 200, 'Change sensitivity %', step=5,
+            callback=controller.on_change_sensitivity_update)
+        self.change_sensitivity.setValue(50)
+
         # Global memory (cross-video exemplar pairs)
         self.global_mem_list = QListWidget()
         self.global_mem_list.setMaximumHeight(100)
@@ -384,6 +422,8 @@ class GUI(QWidget):
         import_area.addWidget(self.import_layer_button)
         import_area.addWidget(self.auto_seg_button)
         right_area.addLayout(import_area)
+        right_area.addWidget(self.detect_changes_button)
+        right_area.addLayout(self.change_sensitivity_layout)
 
         # Global memory
         right_area.addWidget(QLabel('Global Memory (cross-video)'))
@@ -480,6 +520,15 @@ class GUI(QWidget):
 
         # auto-segment current frame
         QShortcut(QKeySequence(Qt.Key.Key_A), self).activated.connect(controller.on_auto_segment)
+
+        # change point detection
+        QShortcut(QKeySequence(Qt.Key.Key_H), self).activated.connect(controller.on_detect_changes)
+        QShortcut(QKeySequence(Qt.Key.Key_J), self).activated.connect(controller.on_next_change_marker)
+        QShortcut(QKeySequence(Qt.Key.Key_K), self).activated.connect(controller.on_prev_change_marker)
+        QShortcut(QKeySequence(Qt.Key.Key_H | Qt.KeyboardModifier.ShiftModifier),
+                    self).activated.connect(controller.on_clear_change_markers)
+        QShortcut(QKeySequence(Qt.Key.Key_V), self).activated.connect(
+            controller.on_toggle_change_heatmap)
 
         # save to global memory
         QShortcut(QKeySequence(Qt.Key.Key_G),
