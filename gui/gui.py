@@ -6,10 +6,11 @@ from omegaconf import DictConfig
 
 from PySide6.QtWidgets import (QWidget, QComboBox, QCheckBox, QHBoxLayout, QLabel, QPushButton,
                                QTextEdit, QSpinBox, QPlainTextEdit, QVBoxLayout, QSizePolicy,
-                               QButtonGroup, QSlider, QRadioButton, QApplication, QFileDialog)
+                               QButtonGroup, QSlider, QRadioButton, QApplication, QFileDialog,
+                               QListWidget, QListWidgetItem)
 
 from PySide6.QtGui import (QKeySequence, QShortcut, QTextCursor, QImage, QPixmap, QIcon)
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QSize
 
 from gui.cutie.utils.palette import custom_palette_np, custom_names
 from gui.gui_utils import *
@@ -49,6 +50,14 @@ class GUI(QWidget):
         self.backward_run_button = QPushButton('Propagate backward')
         self.backward_run_button.clicked.connect(controller.on_backward_propagation)
         self.backward_run_button.setMinimumWidth(150)
+
+        # gap-filling toggle
+        self.fill_gaps_checkbox = QCheckBox('Fill gaps')
+        self.fill_gaps_checkbox.setChecked(False)
+        self.fill_gaps_checkbox.setToolTip(
+            'Dilate each segment into unassigned (background) pixels to close thin gaps between segments'
+        )
+        self.fill_gaps_checkbox.stateChanged.connect(controller.on_fill_gaps_toggle)
 
         # universal progressbar
         self.progressbar = QProgressBar()
@@ -165,19 +174,30 @@ class GUI(QWidget):
         self.auto_seg_button = QPushButton('Auto-segment (A)')
         self.auto_seg_button.clicked.connect(controller.on_auto_segment)
 
+        # Global memory (cross-video exemplar pairs)
+        self.global_mem_list = QListWidget()
+        self.global_mem_list.setMaximumHeight(100)
+
+        self.save_global_mem_button = QPushButton('Save (G)')
+        self.save_global_mem_button.clicked.connect(controller.on_save_to_global_memory)
+        self.load_file_button = QPushButton('Load File')
+        self.load_file_button.clicked.connect(controller.on_load_file_from_global_memory)
+        self.load_folder_button = QPushButton('Load Folder')
+        self.load_folder_button.clicked.connect(controller.on_load_folder_from_global_memory)
+        self.load_all_button = QPushButton('Load All')
+        self.load_all_button.clicked.connect(controller.on_load_all_from_global_memory)
+        self.remove_global_mem_button = QPushButton('Remove')
+        self.remove_global_mem_button.clicked.connect(controller.on_remove_global_memory_folder)
+
         # Console on the GUI
         self.console = QPlainTextEdit()
         self.console.setReadOnly(True)
         self.console.setMinimumHeight(100)
         self.console.setMaximumHeight(100)
 
-        # Tips for the users
-        self.tips = QTextEdit()
-        self.tips.setReadOnly(True)
-        self.tips.setTextInteractionFlags(Qt.NoTextInteraction)
-        self.tips.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        with open(Path(__file__).parent / 'TIPS.md', 'r') as f:
-            self.tips.setMarkdown(f.read())
+        # Open workspace folder
+        self.open_workspace_button = QPushButton('Open Workspace Folder')
+        self.open_workspace_button.clicked.connect(controller.on_open_workspace)
 
         # navigator
         navi = QHBoxLayout()
@@ -230,6 +250,7 @@ class GUI(QWidget):
         control_topbox.addWidget(self.commit_button)
         control_topbox.addWidget(self.forward_run_button)
         control_topbox.addWidget(self.backward_run_button)
+        control_topbox.addWidget(self.fill_gaps_checkbox)
         control_botbox.addWidget(self.progressbar)
         control_subbox.addLayout(control_topbox)
         control_subbox.addLayout(control_botbox)
@@ -242,8 +263,7 @@ class GUI(QWidget):
         # right area
         right_area = QVBoxLayout()
         right_area.setAlignment(Qt.AlignmentFlag.AlignBottom)
-        right_area.addWidget(self.tips)
-        # right_area.addStretch(1)
+        right_area.addWidget(self.open_workspace_button)
 
         # Parameters
         right_area.addLayout(self.perm_mem_gauge_layout)
@@ -265,6 +285,17 @@ class GUI(QWidget):
         import_area.addWidget(self.import_layer_button)
         import_area.addWidget(self.auto_seg_button)
         right_area.addLayout(import_area)
+
+        # Global memory
+        right_area.addWidget(QLabel('Global Memory (cross-video)'))
+        right_area.addWidget(self.global_mem_list)
+        global_mem_buttons = QHBoxLayout()
+        global_mem_buttons.addWidget(self.save_global_mem_button)
+        global_mem_buttons.addWidget(self.load_file_button)
+        global_mem_buttons.addWidget(self.load_folder_button)
+        global_mem_buttons.addWidget(self.load_all_button)
+        global_mem_buttons.addWidget(self.remove_global_mem_button)
+        right_area.addLayout(global_mem_buttons)
 
         # console
         right_area.addWidget(self.console)
@@ -323,8 +354,20 @@ class GUI(QWidget):
         # Toggle visualization mode
         QShortcut(QKeySequence(Qt.Key.Key_T), self).activated.connect(controller.on_toggle_vis_mode)
 
+        # F1-F6: switch visualization mode directly
+        vis_modes = ['mask', 'davis', 'fade', 'light', 'popup', 'rgba']
+        fkeys = [Qt.Key.Key_F1, Qt.Key.Key_F2, Qt.Key.Key_F3,
+                 Qt.Key.Key_F4, Qt.Key.Key_F5, Qt.Key.Key_F6]
+        for key, mode in zip(fkeys, vis_modes):
+            QShortcut(QKeySequence(key), self).activated.connect(
+                functools.partial(controller.set_vis_mode_direct, mode))
+
         # auto-segment current frame
         QShortcut(QKeySequence(Qt.Key.Key_A), self).activated.connect(controller.on_auto_segment)
+
+        # save to global memory
+        QShortcut(QKeySequence(Qt.Key.Key_G),
+                    self).activated.connect(controller.on_save_to_global_memory)
 
         # undo last mask edit
         QShortcut(QKeySequence(Qt.Key.Key_Z | Qt.KeyboardModifier.ControlModifier),
@@ -492,6 +535,12 @@ class GUI(QWidget):
         rgb = f'rgb({r},{g},{b})'
         self.object_color.setFixedSize(50, 30)  # Make it square
         self.object_color.setStyleSheet(f'QLabel {{ background-color: {rgb}; border: 1px solid #d3d3d3; }}')
+
+    def update_global_memory_list(self, folders):
+        """Refresh the global memory list with ``[(name, count), ...]``."""
+        self.global_mem_list.clear()
+        for name, count in folders:
+            self.global_mem_list.addItem(f'{name}  ({count} files)')
 
     def progressbar_update(self, progress: float):
         self.progressbar.setValue(int(progress * 100))

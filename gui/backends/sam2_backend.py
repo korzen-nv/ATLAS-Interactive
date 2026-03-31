@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from gui.backends.base import MemoryStatus
+from gui.backends.virtual_frames import VirtualFrameProxy
 
 log = logging.getLogger(__name__)
 
@@ -311,8 +312,33 @@ class Sam2PropagationBackend:
             mask_dict[int(oid)] = masks[i].squeeze(0).float()
         return self._binary_dict_to_prob(mask_dict)
 
+    def inject_permanent_memory(self, image, mask, objects):
+        self._ensure_state()
+        if not isinstance(self._state["images"], VirtualFrameProxy):
+            self._state["images"] = VirtualFrameProxy(self._state["images"])
+        processed = self._prepare_foreign_image(image)
+        virtual_idx = self._state["images"].add_virtual(processed)
+        saved_ti = self._curr_ti
+        self._curr_ti = virtual_idx
+        self._step_with_mask(mask, objects, idx_mask=True, force_permanent=True)
+        self._curr_ti = saved_ti
+
+    def _prepare_foreign_image(self, image: torch.Tensor) -> torch.Tensor:
+        """Resize and normalize a (3, H, W) [0,1] tensor for SAM 2 state."""
+        img_size = self._predictor.image_size
+        img = F.interpolate(
+            image.unsqueeze(0), size=(img_size, img_size),
+            mode='bilinear', align_corners=False,
+        ).squeeze(0)
+        mean = torch.tensor([0.485, 0.456, 0.406], device=img.device).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=img.device).view(3, 1, 1)
+        img = (img - mean) / std
+        return img.cpu()
+
     def clear_memory(self) -> None:
         if self._state is not None:
+            if isinstance(self._state["images"], VirtualFrameProxy):
+                self._state["images"].clear_virtual()
             self._predictor.reset_state(self._state)
         self._permanent_anchors.clear()
         self._all_anchors.clear()

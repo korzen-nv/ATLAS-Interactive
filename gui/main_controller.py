@@ -8,6 +8,8 @@ import cv2
 # fix conflicts between qt5 and cv2
 os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH")
 
+from scipy.ndimage import binary_dilation
+
 import torch
 try:
     from torch import mps
@@ -26,6 +28,7 @@ from gui.resource_manager import ResourceManager
 from gui.gui import GUI
 from gui.reader import PropagationReader, get_data_loader
 from gui.exporter import convert_frames_to_video, convert_mask_to_binary
+from gui.global_memory import GlobalMemoryStore
 
 from gui.cutie.utils.palette import custom_palette_np # added
 
@@ -62,6 +65,12 @@ class MainController():
         if 'workspace_init_only' in cfg and cfg['workspace_init_only']:
             return
 
+        # persistent cross-video memory
+        workspace_root = cfg.get('workspace_root', os.path.dirname(cfg['workspace']))
+        global_mem_dir = cfg.get('global_memory_dir',
+                                 os.path.join(workspace_root, 'global_memory'))
+        self.global_memory = GlobalMemoryStore(global_mem_dir)
+
         # initializing the network(s) — after ResourceManager so image_dir is available
         self.initialize_networks()
         self.processor = self._propagation
@@ -94,6 +103,7 @@ class MainController():
         self.vis_image: np.ndarray = None
         self.save_visualization_mode: str = 'None'
         self.save_soft_mask: bool = False
+        self.fill_gaps: bool = False
 
         self.interacted_prob: torch.Tensor = None
         self.overlay_layer: np.ndarray = None
@@ -130,6 +140,7 @@ class MainController():
         self.in_polygon_mode = False
 
         self.gui.show()
+        self.gui.update_global_memory_list(self.global_memory.folders())
         self.gui.text('Initialized.')
         self.initialized = True
 
@@ -360,6 +371,11 @@ class MainController():
         self.vis_mode = self.gui.combo.currentText()
         self.show_current_frame()
 
+    def set_vis_mode_direct(self, mode: str):
+        self.vis_mode = mode
+        self.gui.combo.setCurrentText(mode)
+        self.show_current_frame()
+
     def _snapshot_mask(self):
         """Push the current mask state onto the undo stack (before mutation)."""
         prob = self.curr_prob.cpu().clone() if self.curr_prob is not None else None
@@ -440,6 +456,8 @@ class MainController():
                                                  idx_mask=False,
                                                  frame_idx=self.curr_ti)
             self.curr_mask = torch_prob_to_numpy_mask(self.curr_prob)
+            if self.fill_gaps:
+                self.curr_mask = self.fill_mask_gaps(self.curr_mask)
             # clear
             self.interacted_prob = None
             self.reset_this_interaction()
@@ -465,6 +483,8 @@ class MainController():
                 self.curr_prob = self.processor.step(self.curr_image_torch,
                                                      frame_idx=self.curr_ti)
                 self.curr_mask = torch_prob_to_numpy_mask(self.curr_prob)
+                if self.fill_gaps:
+                    self.curr_mask = self.fill_mask_gaps(self.curr_mask)
 
                 self.save_current_mask()
                 self.show_current_frame(fast=True)
@@ -783,8 +803,179 @@ class MainController():
         self.show_current_frame()
         self.gui.text(f'Auto-segmented frame {self.curr_ti}.')
 
+    # -- Global memory (cross-video exemplars) ----------------------------------
+
+    def on_save_to_global_memory(self):
+        """Save the current frame's image + mask to the persistent global store."""
+        if self.curr_mask.max() == 0:
+            self.gui.text('Nothing to save — current mask is empty.')
+            return
+
+        video_name = os.path.basename(self.cfg['workspace'])
+        frame_name = self.res_man.names[self.curr_ti]
+
+        objects = sorted(set(int(v) for v in np.unique(self.curr_mask)) - {0})
+        item = self.global_memory.add(
+            name=frame_name,
+            image=self.curr_image_np,
+            mask=self.curr_mask,
+            source_video=video_name,
+            frame_idx=self.curr_ti,
+            palette=self.res_man.palette,
+        )
+        self._refresh_global_memory_list()
+        self.gui.text(
+            f'Saved frame {self.curr_ti} to {video_name}/ — '
+            f'objects {objects}, '
+            f'{self.global_memory.total_count()} total items.'
+        )
+
+    # -- loading from global memory -------------------------------------------
+
+    def _inject_items(self, items):
+        """Inject a list of GlobalMemoryItems into permanent memory."""
+        loaded = 0
+        for item in items:
+            self.gui.text(f'  Loading "{item.name}" from {item.source_video} (frame {item.frame_idx})...')
+            self.gui.process_events()
+
+            foreign_image_np = item.load_image()
+            foreign_mask_np = item.load_mask()
+
+            if foreign_mask_np.shape[:2] != (self.h, self.w):
+                foreign_mask_np = cv2.resize(foreign_mask_np, (self.w, self.h),
+                                             interpolation=cv2.INTER_NEAREST)
+            if foreign_image_np.shape[:2] != (self.h, self.w):
+                foreign_image_np = cv2.resize(foreign_image_np, (self.w, self.h),
+                                              interpolation=cv2.INTER_LINEAR)
+
+            if foreign_mask_np.max() > self.num_objects:
+                self.gui.text(
+                    f'  Skipped "{item.name}" — class {foreign_mask_np.max()} '
+                    f'exceeds num_objects={self.num_objects}.'
+                )
+                continue
+
+            foreign_image_torch = to_tensor(foreign_image_np).to(self.device)
+            foreign_mask_torch = torch.from_numpy(
+                foreign_mask_np.astype(np.int64)
+            ).to(self.device)
+            objects = sorted(set(int(v) for v in np.unique(foreign_mask_np)) - {0})
+
+            with autocast(self.device, enabled=(self.amp and self.device == 'cuda')):
+                self.processor.inject_permanent_memory(
+                    foreign_image_torch, foreign_mask_torch, objects,
+                )
+            loaded += 1
+            self.gui.text(f'  Done — objects {objects}, shape {foreign_image_np.shape[:2]}')
+
+        self.update_memory_gauges()
+        return loaded
+
+    def _selected_folder_name(self):
+        """Return the folder name selected in the global memory list, or None."""
+        rows = [idx.row() for idx in self.gui.global_mem_list.selectedIndexes()]
+        if not rows:
+            return None
+        folders = self.global_memory.folders()
+        row = rows[0]
+        if row >= len(folders):
+            return None
+        return folders[row][0]
+
+    def on_load_file_from_global_memory(self):
+        """Pick a single file from the selected folder and inject it."""
+        from PySide6.QtWidgets import QInputDialog
+
+        folder_name = self._selected_folder_name()
+        if folder_name is None:
+            self.gui.text('Select a folder first.')
+            return
+
+        items = self.global_memory.folder_items(folder_name)
+        if not items:
+            self.gui.text(f'No items in {folder_name}.')
+            return
+
+        names = [f'{it.name}  (frame {it.frame_idx})' for it in items]
+        chosen, ok = QInputDialog.getItem(
+            self.gui, 'Load File', f'Select item from {folder_name}:',
+            names, 0, False,
+        )
+        if not ok:
+            return
+        idx = names.index(chosen)
+        n = self._inject_items([items[idx]])
+        self.gui.text(f'Injected {n} item from {folder_name}.')
+
+    def on_load_folder_from_global_memory(self):
+        """Inject all items from the selected folder."""
+        folder_name = self._selected_folder_name()
+        if folder_name is None:
+            self.gui.text('Select a folder first.')
+            return
+
+        items = self.global_memory.folder_items(folder_name)
+        n = self._inject_items(items)
+        self.gui.text(f'Injected {n} item(s) from {folder_name}.')
+
+    def on_load_all_from_global_memory(self):
+        """Inject all items from all folders."""
+        items = self.global_memory.all_items()
+        if not items:
+            self.gui.text('Global memory is empty.')
+            return
+        n = self._inject_items(items)
+        self.gui.text(f'Injected {n} item(s) from global memory.')
+
+    def on_remove_global_memory_folder(self):
+        """Remove the selected folder from the global memory store."""
+        folder_name = self._selected_folder_name()
+        if folder_name is None:
+            self.gui.text('Select a folder to remove.')
+            return
+        self.global_memory.remove_folder(folder_name)
+        self._refresh_global_memory_list()
+        self.gui.text(f'Removed folder {folder_name}.')
+
+    def _refresh_global_memory_list(self):
+        self.gui.update_global_memory_list(self.global_memory.folders())
+
+    def on_open_workspace(self):
+        """Open the current workspace folder in the system file manager."""
+        import subprocess, sys
+        workspace = self.cfg['workspace']
+        if sys.platform == 'darwin':
+            subprocess.Popen(['open', workspace])
+        elif sys.platform == 'win32':
+            subprocess.Popen(['explorer', workspace])
+        else:
+            subprocess.Popen(['xdg-open', workspace])
+        self.gui.text(f'Opening {workspace}')
+
     def on_save_soft_mask_toggle(self):
         self.save_soft_mask = self.gui.save_soft_mask_checkbox.isChecked()
+
+    def on_fill_gaps_toggle(self):
+        self.fill_gaps = self.gui.fill_gaps_checkbox.isChecked()
+        state = 'ON' if self.fill_gaps else 'OFF'
+        self.gui.text(f'Fill gaps: {state}')
+
+    def fill_mask_gaps(self, mask: np.ndarray, iterations: int = 3) -> np.ndarray:
+        """Dilate each labeled segment into background pixels to close thin gaps."""
+        bg_mask = (mask == 0)
+        if not bg_mask.any():
+            return mask
+        mask = mask.copy()
+        obj_ids = np.unique(mask)
+        obj_ids = obj_ids[obj_ids > 0]
+        for obj_id in obj_ids:
+            obj_mask = (mask == obj_id)
+            dilated = binary_dilation(obj_mask, iterations=iterations)
+            fill = dilated & bg_mask
+            mask[fill] = obj_id
+            bg_mask[fill] = False
+        return mask
 
     def on_mouse_motion_xy(self, x: int, y: int):
         self.last_ex, self.last_ey = x, y

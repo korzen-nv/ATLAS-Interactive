@@ -21,11 +21,14 @@
       "Bash(uv run:*)",
       "Bash(file /home/pkorzeniowsk/Projects/surgnet/SurgNetXL Seg Head/*.pth)",
       "Bash(python3:*)",
-      "Bash(find /home/pkorzeniowsk/Projects -path *surgnet* -name *.py -type f)"
+      "Bash(find /home/pkorzeniowsk/Projects -path *surgnet* -name *.py -type f)",
+      "Bash(find /home/pkorzeniowsk/Projects/atlas/ATLAS-Interactive -name *.ui -o -name *config* -type f)",
+      "Bash(find /home/pkorzeniowsk/Projects/atlas/ATLAS-Interactive -type f \\\\\\(-name *.qrc -o -name *.rcc -o -name *.ui -o -name *resource* \\\\\\))",
+      "Bash(grep -r \"prev_mask\\\\|prev_mask_to_logits\" /home/pkorzeniowsk/Projects/atlas/ATLAS-Interactive/gui/backends/*.py)"
     ]
   },
   "sandbox": {
-    "enabled": false,
-    "autoAllowBashIfSandboxed": false
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true
   }
 }

@@ -81,6 +81,25 @@ class PropagationBackend(Protocol):
         """Convert (num_objects+1, H, W) probs to (H, W) index mask."""
         ...
 
+    def inject_permanent_memory(
+        self,
+        image: torch.Tensor,
+        mask: torch.Tensor,
+        objects: List[int],
+    ) -> None:
+        """Inject a foreign image+mask pair as a permanent conditioning anchor.
+
+        Unlike ``step()``, this does **not** advance the frame counter, modify
+        the current segmentation, or trigger propagation.  The pair is stored
+        in permanent memory for cross-video conditioning.
+
+        Args:
+            image: (3, H, W) RGB float tensor in [0, 1].
+            mask: (H, W) index mask (uint8/int64).
+            objects: object IDs present in the mask (excluding background 0).
+        """
+        ...
+
     def get_memory_status(self) -> MemoryStatus:
         """Return current memory utilization for UI gauges."""
         ...

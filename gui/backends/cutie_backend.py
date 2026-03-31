@@ -53,6 +53,26 @@ class CutieBackend:
     def output_prob_to_mask(self, output_prob: torch.Tensor) -> torch.Tensor:
         return self._core.output_prob_to_mask(output_prob)
 
+    def inject_permanent_memory(self, image, mask, objects):
+        import torch
+        # Build a one-hot mask with a channel for EVERY object (not just
+        # those present) so CUTIE registers them all in canonical order —
+        # avoids tmp_id ordering assertions when subsets differ across calls.
+        num_objects = self._cfg['num_objects']
+        prob_mask = torch.zeros(num_objects, *mask.shape[-2:],
+                                device=mask.device, dtype=torch.float)
+        for i in range(num_objects):
+            prob_mask[i] = (mask == (i + 1)).float()
+
+        saved_ti = self._core.curr_ti
+        saved_last_mem_ti = self._core.last_mem_ti
+        # Clear sensory memory to avoid spatial-size mismatches with
+        # features cached from prior video frames.
+        self._core.memory.clear_sensory_memory()
+        self._core.step(image, prob_mask, idx_mask=False, force_permanent=True)
+        self._core.curr_ti = saved_ti
+        self._core.last_mem_ti = saved_last_mem_ti
+
     def get_memory_status(self) -> MemoryStatus:
         try:
             return MemoryStatus(
