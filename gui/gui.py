@@ -36,6 +36,9 @@ class MarkerSlider(QSlider):
         self._change_markers: set[int] = set()
         self._change_color = QColor(255, 160, 0)
         self._change_active_color = QColor(255, 200, 100)
+        self._uncertainty_markers: set[int] = set()
+        self._uncertainty_color = QColor(255, 50, 50)
+        self._uncertainty_active_color = QColor(255, 150, 80)
         self._hovered_idx: int | None = None
         self.setMouseTracking(True)
 
@@ -49,6 +52,14 @@ class MarkerSlider(QSlider):
 
     def clear_change_markers(self):
         self._change_markers.clear()
+        self.update()
+
+    def set_uncertainty_markers(self, frame_indices: set[int]):
+        self._uncertainty_markers = set(frame_indices)
+        self.update()
+
+    def clear_uncertainty_markers(self):
+        self._uncertainty_markers.clear()
         self.update()
 
     def _groove_params(self):
@@ -65,7 +76,7 @@ class MarkerSlider(QSlider):
 
     def _x_to_nearest_marker(self, x):
         best_idx, best_dist = None, self.HIT_RADIUS + 1
-        for idx in self._markers | self._change_markers:
+        for idx in self._markers | self._change_markers | self._uncertainty_markers:
             mx = self._idx_to_x(idx)
             if mx is None:
                 continue
@@ -90,7 +101,7 @@ class MarkerSlider(QSlider):
 
     def mouseReleaseEvent(self, event):
         # if clicking on a marker (permanent or change), jump to that frame
-        if event.button() == Qt.MouseButton.LeftButton and (self._markers or self._change_markers):
+        if event.button() == Qt.MouseButton.LeftButton and (self._markers or self._change_markers or self._uncertainty_markers):
             clicked = self._x_to_nearest_marker(event.position().x())
             if clicked is not None:
                 self.setValue(clicked)
@@ -99,7 +110,7 @@ class MarkerSlider(QSlider):
 
     def paintEvent(self, event):
         super().paintEvent(event)
-        if not self._markers and not self._change_markers:
+        if not self._markers and not self._change_markers and not self._uncertainty_markers:
             return
 
         painter = QPainter(self)
@@ -108,7 +119,24 @@ class MarkerSlider(QSlider):
         groove_y = self.height() // 2
         current_val = self.value()
 
-        # draw change markers first (below permanent markers)
+        # draw uncertainty markers (red upward triangles)
+        for idx in self._uncertainty_markers:
+            mx = self._idx_to_x(idx)
+            if mx is None:
+                continue
+            active = (idx == self._hovered_idx or idx == current_val)
+            r = self.CHANGE_R_HIGHLIGHT if active else self.CHANGE_R
+            color = self._uncertainty_active_color if active else self._uncertainty_color
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            triangle = QPolygonF([
+                QPointF(mx, groove_y - r),
+                QPointF(mx + r, groove_y + r),
+                QPointF(mx - r, groove_y + r),
+            ])
+            painter.drawPolygon(triangle)
+
+        # draw change markers (below permanent markers)
         for idx in self._change_markers:
             mx = self._idx_to_x(idx)
             if mx is None:
@@ -543,6 +571,11 @@ class GUI(QWidget):
         # undo last mask edit
         QShortcut(QKeySequence(Qt.Key.Key_Z | Qt.KeyboardModifier.ControlModifier),
                     self).activated.connect(controller.on_undo)
+
+        # uncertainty marker navigation
+        QShortcut(QKeySequence(Qt.Key.Key_N), self).activated.connect(controller.on_next_uncertainty_marker)
+        QShortcut(QKeySequence(Qt.Key.Key_N | Qt.KeyboardModifier.ShiftModifier),
+                    self).activated.connect(controller.on_clear_uncertainty_markers)
 
         # brush / eraser mode
         QShortcut(QKeySequence(Qt.Key.Key_P), self).activated.connect(controller.on_toggle_brush_mode)

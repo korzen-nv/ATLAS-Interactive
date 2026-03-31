@@ -108,6 +108,10 @@ class MainController():
         self._change_heatmaps: dict[int, np.ndarray] = {}
         self._show_change_heatmap: bool = False
 
+        # uncertainty markers (computed during propagation)
+        self.uncertainty_markers: set[int] = set()
+        self._uncertainty_scores: dict[int, float] = {}
+
         # visualization info
         self.vis_mode: str = 'davis'
         self.vis_image: np.ndarray = None
@@ -609,6 +613,10 @@ class MainController():
             dataset = PropagationReader(self.res_man, self.curr_ti, self.propagate_direction)
             loader = get_data_loader(dataset, self.cfg.num_read_workers)
 
+            # uncertainty tracking
+            prev_mask_unc = self.curr_mask.copy()
+            unc_scores: dict[int, float] = {}
+
             # propagate till the end
             for data in loader:
                 if not self.propagating:
@@ -623,6 +631,11 @@ class MainController():
                 if self.fill_gaps:
                     self.curr_mask = self.fill_mask_gaps(self.curr_mask)
 
+                # compute uncertainty: 1 - IoU vs previous frame
+                iou = self._compute_mask_iou(prev_mask_unc, self.curr_mask)
+                unc_scores[self.curr_ti] = 1.0 - iou
+                prev_mask_unc = self.curr_mask.copy()
+
                 self.save_current_mask()
                 self.show_current_frame(fast=True)
 
@@ -631,6 +644,9 @@ class MainController():
 
                 if self.curr_ti == 0 or self.curr_ti == self.T - 1:
                     break
+
+            self._uncertainty_scores = unc_scores
+            self._update_uncertainty_markers()
 
             self.propagating = False
             self.curr_frame_dirty = False
@@ -659,6 +675,9 @@ class MainController():
                                 idx_mask=False,
                                 frame_idx=self.curr_ti)
 
+            prev_mask_unc = self.curr_mask.copy()
+            unc_scores: dict[int, float] = {}
+
             for _ in range(n):
                 at_boundary = (direction == 'forward' and self.curr_ti >= self.T - 1) or \
                               (direction == 'backward' and self.curr_ti <= 0)
@@ -679,9 +698,16 @@ class MainController():
                 if self.fill_gaps:
                     self.curr_mask = self.fill_mask_gaps(self.curr_mask)
 
+                iou = self._compute_mask_iou(prev_mask_unc, self.curr_mask)
+                unc_scores[self.curr_ti] = 1.0 - iou
+                prev_mask_unc = self.curr_mask.copy()
+
                 self.save_current_mask()
                 self.show_current_frame(fast=True)
                 self.gui.process_events()
+
+            self._uncertainty_scores.update(unc_scores)
+            self._update_uncertainty_markers()
 
             self.curr_frame_dirty = False
             self.show_current_frame()
@@ -936,6 +962,45 @@ class MainController():
         self.gui.tl_slider.set_change_markers(self.change_markers)
         self.show_current_frame()
         self.gui.text('Change markers cleared.')
+
+    # ── Uncertainty markers ─────────────────────────────────────────────
+
+    def _compute_mask_iou(self, mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+        fg_a = mask_a > 0
+        fg_b = mask_b > 0
+        intersection = np.logical_and(fg_a, fg_b).sum()
+        union = np.logical_or(fg_a, fg_b).sum()
+        if union == 0:
+            return 1.0
+        return float(intersection / union)
+
+    def _update_uncertainty_markers(self):
+        if not self._uncertainty_scores:
+            return
+        scores = np.array(list(self._uncertainty_scores.values()))
+        threshold = scores.mean() + 2 * scores.std()
+        self.uncertainty_markers = {
+            ti for ti, s in self._uncertainty_scores.items() if s > threshold
+        }
+        self.gui.tl_slider.set_uncertainty_markers(self.uncertainty_markers)
+        n = len(self.uncertainty_markers)
+        self.gui.text(f'{n} uncertain frame{"s" if n != 1 else ""} detected. Press N to navigate.')
+
+    def on_next_uncertainty_marker(self):
+        after = sorted(i for i in self.uncertainty_markers if i > self.curr_ti)
+        if after:
+            self.gui.tl_slider.setValue(after[0])
+
+    def on_prev_uncertainty_marker(self):
+        before = sorted((i for i in self.uncertainty_markers if i < self.curr_ti), reverse=True)
+        if before:
+            self.gui.tl_slider.setValue(before[0])
+
+    def on_clear_uncertainty_markers(self):
+        self.uncertainty_markers.clear()
+        self._uncertainty_scores.clear()
+        self.gui.tl_slider.clear_uncertainty_markers()
+        self.gui.text('Uncertainty markers cleared.')
 
     def on_toggle_change_heatmap(self):
         self._show_change_heatmap = not self._show_change_heatmap
