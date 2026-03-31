@@ -142,12 +142,19 @@ class MainController():
         # set callbacks
         self.gui.on_mouse_motion_xy = self.on_mouse_motion_xy
         self.gui.click_fn = self.click_fn
+        self.gui.on_mouse_release_fn = self.on_mouse_release
 
         # Variables for polygon drawing and hovering first point
         self.polygon_points = []
         self.hover_first_point = False
         self.hover_threshold = 8  # pixels
         self.in_polygon_mode = False
+
+        # Brush/eraser mode state
+        self.in_brush_mode = False
+        self.brush_eraser = False
+        self.brush_size = 10
+        self._brush_drawing = False
 
         self.gui.show()
         self._refresh_global_memory_list()
@@ -178,6 +185,27 @@ class MainController():
         self.show_current_frame()
     
     def on_mouse_motion_xy(self, x: int, y: int):
+        # Brush mode: drag painting or hover cursor
+        if self.in_brush_mode:
+            from PySide6.QtCore import Qt
+            buttons = self.gui._mouse_buttons
+            lmb = buttons is not None and buttons & Qt.MouseButton.LeftButton
+            rmb = buttons is not None and buttons & Qt.MouseButton.RightButton
+            if self._brush_drawing and (lmb or rmb):
+                self._brush_continue(x, y)
+            elif lmb and not self._brush_drawing:
+                self._brush_begin(x, y, erase=False)
+            elif rmb and not self._brush_drawing:
+                self._brush_begin(x, y, erase=True)
+            else:
+                if self._brush_drawing:
+                    self._brush_end()
+                self.compose_current_im()
+                self._compose_brush_cursor(x, y)
+                self.update_canvas()
+            self.last_ex, self.last_ey = x, y
+            return
+
         # Check if polygon is being drawn and at least one point exists
         if self.polygon_points:
             # Check distance to first point
@@ -185,7 +213,7 @@ class MainController():
             dist = ((x - first_pt[0])**2 + (y - first_pt[1])**2)**0.5
             was_hovering = self.hover_first_point
             self.hover_first_point = dist <= self.hover_threshold
-            
+
             # If hover state changed, redraw polygon overlay to update color
             if self.hover_first_point != was_hovering:
                 self.compose_polygon_overlay()
@@ -220,6 +248,74 @@ class MainController():
                 radius = 4
             cv2.circle(self.vis_image, pt, radius=radius, color=color, thickness=-1)
 
+    # ── Brush / Eraser mode ──────────────────────────────────────────────
+
+    def on_toggle_brush_mode(self):
+        self.in_brush_mode = not self.in_brush_mode
+        if self.in_brush_mode:
+            self.in_polygon_mode = False
+            self.polygon_points = []
+            self.hover_first_point = False
+            self.gui.text(f'Brush mode ON  (size {self.brush_size})  LMB=paint  RMB=erase')
+        else:
+            self._brush_drawing = False
+            self.gui.text('Click mode ON')
+        self.show_current_frame()
+
+    def on_brush_size_change(self, delta: int):
+        self.brush_size = max(1, min(100, self.brush_size + delta))
+        self.gui.text(f'Brush size: {self.brush_size}')
+        if self.in_brush_mode and not self._brush_drawing:
+            self.compose_current_im()
+            self._compose_brush_cursor(self.last_ex, self.last_ey)
+            self.update_canvas()
+
+    def _brush_stamp(self, x: int, y: int, erase: bool = False):
+        stamp = np.zeros((self.h, self.w), dtype=np.uint8)
+        cv2.circle(stamp, (int(x), int(y)), self.brush_size, 1, -1)
+        if erase:
+            self.curr_mask[stamp > 0] = 0
+        else:
+            self.curr_mask[stamp > 0] = self.curr_object
+
+    def _brush_begin(self, x: int, y: int, erase: bool = False):
+        self._snapshot_mask()
+        self._brush_drawing = True
+        self.brush_eraser = erase
+        self._brush_stamp(x, y, erase=erase)
+        self.compose_current_im()
+        self._compose_brush_cursor(x, y)
+        self.update_canvas()
+
+    def _brush_continue(self, x: int, y: int):
+        self._brush_stamp(x, y, erase=self.brush_eraser)
+        self.compose_current_im()
+        self._compose_brush_cursor(x, y)
+        self.update_canvas()
+
+    def _brush_end(self):
+        if not self._brush_drawing:
+            return
+        self._brush_drawing = False
+        self.curr_prob = index_numpy_to_one_hot_torch(
+            self.curr_mask, self.num_objects + 1
+        ).to(self.device)
+        self.save_current_mask()
+        self.show_current_frame()
+
+    def on_mouse_release(self):
+        if self.in_brush_mode and self._brush_drawing:
+            self._brush_end()
+
+    def _compose_brush_cursor(self, x: int, y: int):
+        if self.brush_eraser:
+            color = (255, 255, 255)
+        else:
+            r, g, b = custom_palette_np[self.curr_object]
+            color = (int(r), int(g), int(b))
+        cv2.circle(self.vis_image, (int(x), int(y)), self.brush_size,
+                   color, thickness=1, lineType=cv2.LINE_AA)
+
     def click_fn(self, action: Literal['left', 'right', 'middle', 'pick'], x: int, y: int):
         if self.propagating:
             return
@@ -234,6 +330,19 @@ class MainController():
 
         if not hasattr(self, 'in_polygon_mode'):
             self.in_polygon_mode = False  # new flag to track current mode
+
+        # Brush mode dispatch: LMB = paint, RMB = erase
+        if self.in_brush_mode:
+            if action == 'left':
+                self._brush_begin(x, y, erase=False)
+            elif action == 'right':
+                self._brush_begin(x, y, erase=True)
+            elif action == 'middle':
+                self.in_brush_mode = False
+                self._brush_drawing = False
+                self.gui.text('Click mode ON')
+                self.show_current_frame()
+            return
 
         if action == 'middle':
             # Toggle polygon mode

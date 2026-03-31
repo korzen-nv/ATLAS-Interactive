@@ -149,6 +149,8 @@ class GUI(QWidget):
         # callbacks to be set by the controller
         self.on_mouse_motion_xy = None
         self.click_fn = None
+        self.on_mouse_release_fn = lambda: None
+        self._mouse_buttons = None
 
         self.controller = controller
         self.cfg = cfg
@@ -542,6 +544,13 @@ class GUI(QWidget):
         QShortcut(QKeySequence(Qt.Key.Key_Z | Qt.KeyboardModifier.ControlModifier),
                     self).activated.connect(controller.on_undo)
 
+        # brush / eraser mode
+        QShortcut(QKeySequence(Qt.Key.Key_P), self).activated.connect(controller.on_toggle_brush_mode)
+        QShortcut(QKeySequence(Qt.Key.Key_BracketLeft),
+                    self).activated.connect(functools.partial(controller.on_brush_size_change, -2))
+        QShortcut(QKeySequence(Qt.Key.Key_BracketRight),
+                    self).activated.connect(functools.partial(controller.on_brush_size_change, 2))
+
         # quit shortcut
         QShortcut(QKeySequence(Qt.Key.Key_Q), self).activated.connect(self.close)
 
@@ -659,6 +668,7 @@ class GUI(QWidget):
         QApplication.processEvents()
 
     def on_mouse_press(self, event):
+        event.accept()
         if self.is_pos_out_of_bound(event.position().x(), event.position().y()):
             return
 
@@ -672,15 +682,20 @@ class GUI(QWidget):
             action = 'right'
         elif event.button() == Qt.MouseButton.MiddleButton:
             action = 'middle'
+        else:
+            return
 
         self.click_fn(action, ex, ey)
 
     def on_mouse_motion(self, event):
+        event.accept()
         ex, ey = self.get_scaled_pos(event.position().x(), event.position().y())
+        self._mouse_buttons = event.buttons()
         self.on_mouse_motion_xy(ex, ey)
 
     def on_mouse_release(self, event):
-        pass
+        event.accept()
+        self.on_mouse_release_fn()
 
     def on_play_video(self):
         if self.timer.isActive():
