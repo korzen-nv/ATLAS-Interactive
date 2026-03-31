@@ -151,6 +151,7 @@ def _create_sam31(cfg, device, image_dir, shared_model):
     from gui.backends.sam31_backend import Sam31ClickBackend, Sam31PropagationBackend
 
     checkpoint = cfg.get('sam31_weights')  # None → auto-download from HF
+    lora_weights = cfg.get('sam31_lora_weights')  # None → no LoRA
 
     propagation = Sam31PropagationBackend(
         checkpoint=checkpoint,
@@ -158,6 +159,7 @@ def _create_sam31(cfg, device, image_dir, shared_model):
         image_dir=image_dir,
         num_objects=cfg.num_objects,
         shared_model=shared_model,
+        lora_weights=lora_weights,
     )
     click = Sam31ClickBackend(
         multiplex_model=propagation._model,

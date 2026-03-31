@@ -39,6 +39,8 @@ sam3_bpe_path: null
 
 # SAM 3.1 config (only used when backend: sam31)
 sam31_weights: gui/weights/sam3.1_multiplex.pt
+# LoRA fine-tune weights for surgical segmentation (set to null to disable)
+sam31_lora_weights: gui/weights/sam31_lora_cholecystectomy.pt
 
 # Auto-segmentation (SurgNetXL seg head) — press 'A' to auto-segment current frame
 # Set autoseg_weights to null or remove to disable
@@ -55,6 +57,11 @@ autoseg_class_map:
   5: 8    # Connective T. → Connective tissue / Cystic plate
   6: 11   # Instruments   → Monopolar hook (first instrument slot)
   7: 15   # Other Anatomy → Other structure
+
+# Change point detection (SurgeNetXL embeddings) — press 'H' to detect
+change_detect_subsample: 1    # process every Nth frame (increase for speed)
+change_detect_sigma: 2.0      # Gaussian smoothing sigma for distance signal
+change_detect_input_size: 256  # resize frames to this size for embedding extraction
 
 # All "size" parameters represent the length of the shorter edge
 # maximum internal processing size; reducing this speeds up processing

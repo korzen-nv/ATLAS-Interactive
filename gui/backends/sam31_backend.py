@@ -114,11 +114,13 @@ class Sam31PropagationBackend:
         num_objects: int,
         *,
         shared_model=None,
+        lora_weights: Optional[str] = None,
     ) -> None:
         if shared_model is not None:
             self._model = shared_model
         else:
-            self._model = self._build_model(checkpoint, device)
+            self._model = self._build_model(checkpoint, device,
+                                            lora_weights=lora_weights)
         self._patch_get_image_feature(self._model)
 
         self._device = device
@@ -137,7 +139,7 @@ class Sam31PropagationBackend:
         self._all_anchors: Dict[int, Tuple[torch.Tensor, List[int]]] = {}
 
     @staticmethod
-    def _build_model(checkpoint, device):
+    def _build_model(checkpoint, device, lora_weights=None):
         from sam3.model_builder import build_sam3_multiplex_video_model
 
         ckpt_path = checkpoint if checkpoint else None
@@ -204,8 +206,58 @@ class Sam31PropagationBackend:
                 log.warning("SAM 3.1 unexpected keys (%d): %s…",
                             len(unexpected), unexpected[:5])
 
+        if lora_weights is not None:
+            Sam31PropagationBackend._apply_lora(model, lora_weights, device)
+
         model.to(device=device)
         return model
+
+    @staticmethod
+    def _apply_lora(model, lora_path: str, device) -> None:
+        """Merge LoRA fine-tune weights into the model in-place.
+
+        This injects LoRA layers, loads the trained A/B matrices, merges
+        them into the base Linear weights, then removes the LoRA wrappers
+        so there is zero runtime overhead during inference.
+        """
+        try:
+            from sam3_lora.lora.lora_utils import (
+                LoRAConfig,
+                inject_lora_into_model,
+                load_lora_state_dict,
+                merge_lora_weights,
+            )
+        except ImportError:
+            # sam3_lora not installed — add MedSAM3 to path
+            import sys
+            from pathlib import Path
+            medsam_dir = str(
+                Path(__file__).resolve().parents[2] / ".." / ".."
+                / "sam3" / "MedSAM3"
+            )
+            if medsam_dir not in sys.path:
+                sys.path.append(medsam_dir)
+            from sam3_lora.lora.lora_utils import (
+                LoRAConfig,
+                inject_lora_into_model,
+                load_lora_state_dict,
+                merge_lora_weights,
+            )
+
+        ckpt = torch.load(lora_path, map_location=device, weights_only=False)
+        lora_cfg = ckpt["config"]["lora"]
+
+        config = LoRAConfig(
+            rank=lora_cfg["rank"],
+            alpha=lora_cfg["alpha"],
+            dropout=0.0,  # No dropout at inference
+            target_modules=lora_cfg.get("target_modules"),
+        )
+        inject_lora_into_model(model, config, verbose=False)
+        load_lora_state_dict(model, ckpt["lora_state_dict"])
+        merge_lora_weights(model)  # Fold LoRA into base weights
+        log.info("Merged LoRA weights from %s (epoch %d)",
+                 lora_path, ckpt.get("epoch", -1) + 1)
 
     # -- State management ------------------------------------------------------
 
