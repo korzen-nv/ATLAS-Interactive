@@ -98,6 +98,9 @@ class MainController():
         # undo stack — stores (frame_idx, mask, prob) snapshots before each edit
         self._undo_stack: deque = deque(maxlen=20)
 
+        # track which frames have been committed to permanent memory
+        self.permanent_memory_frames: set[int] = set()
+
         # visualization info
         self.vis_mode: str = 'davis'
         self.vis_image: np.ndarray = None
@@ -140,7 +143,7 @@ class MainController():
         self.in_polygon_mode = False
 
         self.gui.show()
-        self.gui.update_global_memory_list(self.global_memory.folders())
+        self._refresh_global_memory_list()
         self.gui.text('Initialized.')
         self.initialized = True
 
@@ -501,6 +504,56 @@ class MainController():
             self.on_slider_update()
             self.gui.process_events()
 
+    def on_propagate_forward_one(self, steps=1):
+        if self.propagating or self.curr_ti >= self.T - 1:
+            return
+        self._propagate_n_frames('forward', steps)
+
+    def on_propagate_backward_one(self, steps=1):
+        if self.propagating or self.curr_ti <= 0:
+            return
+        self._propagate_n_frames('backward', steps)
+
+    def _propagate_n_frames(self, direction, n=1):
+        with autocast(self.device, enabled=(self.amp and self.device == 'cuda')):
+            self.convert_current_image_mask_torch()
+            self.processor.clear_sensory_memory()
+            if hasattr(self.processor, 'set_propagation_direction'):
+                self.processor.set_propagation_direction(direction == 'backward')
+            self.processor.step(self.curr_image_torch,
+                                self.curr_prob[1:],
+                                idx_mask=False,
+                                frame_idx=self.curr_ti)
+
+            for _ in range(n):
+                at_boundary = (direction == 'forward' and self.curr_ti >= self.T - 1) or \
+                              (direction == 'backward' and self.curr_ti <= 0)
+                if at_boundary:
+                    break
+
+                if direction == 'forward':
+                    self.on_next_frame()
+                else:
+                    self.on_prev_frame()
+
+                self.curr_image_np = self.res_man.get_image(self.curr_ti)
+                self.curr_image_torch = to_tensor(self.curr_image_np).to(self.device)
+
+                self.curr_prob = self.processor.step(self.curr_image_torch,
+                                                      frame_idx=self.curr_ti)
+                self.curr_mask = torch_prob_to_numpy_mask(self.curr_prob)
+                if self.fill_gaps:
+                    self.curr_mask = self.fill_mask_gaps(self.curr_mask)
+
+                self.save_current_mask()
+                self.show_current_frame(fast=True)
+                self.gui.process_events()
+
+            self.curr_frame_dirty = False
+            self.show_current_frame()
+            self.update_memory_gauges()
+            self.update_gpu_gauges()
+
     def pause_propagation(self):
         self.propagating = False
 
@@ -521,6 +574,8 @@ class MainController():
                                                  idx_mask=False,
                                                  frame_idx=self.curr_ti,
                                                  force_permanent=True)
+            self.permanent_memory_frames.add(self.curr_ti)
+            self.gui.tl_slider.set_markers(self.permanent_memory_frames)
             self.update_memory_gauges()
             self.update_gpu_gauges()
 
@@ -668,6 +723,16 @@ class MainController():
         new_ti = min(self.curr_ti + step, self.length - 1)
         self.gui.tl_slider.setValue(new_ti)
 
+    def on_next_marker(self):
+        after = sorted(i for i in self.permanent_memory_frames if i > self.curr_ti)
+        if after:
+            self.gui.tl_slider.setValue(after[0])
+
+    def on_prev_marker(self):
+        before = sorted((i for i in self.permanent_memory_frames if i < self.curr_ti), reverse=True)
+        if before:
+            self.gui.tl_slider.setValue(before[0])
+
     def update_gpu_gauges(self):
         if 'cuda' in self.device:
             try:
@@ -750,6 +815,8 @@ class MainController():
 
     def on_clear_memory(self):
         self.processor.clear_memory()
+        self.permanent_memory_frames.clear()
+        self.gui.tl_slider.set_markers(self.permanent_memory_frames)
         if 'cuda' in self.device:
             torch.cuda.empty_cache()
         elif 'mps' in self.device:
@@ -876,6 +943,55 @@ class MainController():
             f'{self.global_memory.total_count()} total items.'
         )
 
+    def on_save_all_to_global_memory(self):
+        """Save all permanent-memory frames to global memory, overwriting existing."""
+        if not self.permanent_memory_frames:
+            self.gui.text('No permanent memory frames to save.')
+            return
+
+        video_name = os.path.basename(self.cfg['workspace'])
+
+        # remove existing folder for this video to avoid duplicates
+        self.global_memory.remove_folder(video_name)
+
+        saved = 0
+        for ti in sorted(self.permanent_memory_frames):
+            image_np = self.res_man.get_image(ti)
+            mask_np = self.res_man.get_mask(ti)
+            if mask_np is None or mask_np.max() == 0:
+                self.gui.text(f'  Skipping frame {ti} — empty mask.')
+                continue
+            frame_name = self.res_man.names[ti]
+            self.global_memory.add(
+                name=frame_name,
+                image=image_np,
+                mask=mask_np,
+                source_video=video_name,
+                frame_idx=ti,
+                palette=self.res_man.palette,
+            )
+            saved += 1
+
+        self._refresh_global_memory_list()
+        self.gui.text(
+            f'Saved {saved} frame(s) to global memory ({video_name}/).'
+        )
+
+    def _load_markers_from_global_memory(self):
+        """If global memory has a folder matching this workspace, restore timeline markers."""
+        video_name = os.path.basename(self.cfg['workspace'])
+        items = self.global_memory.folder_items(video_name)
+        if not items:
+            return
+        for item in items:
+            if 0 <= item.frame_idx < self.length:
+                self.permanent_memory_frames.add(item.frame_idx)
+        if self.permanent_memory_frames:
+            self.gui.tl_slider.set_markers(self.permanent_memory_frames)
+            self.gui.text(
+                f'Loaded {len(self.permanent_memory_frames)} marker(s) from global memory ({video_name}/).'
+            )
+
     # -- loading from global memory -------------------------------------------
 
     def _inject_items(self, items):
@@ -929,31 +1045,6 @@ class MainController():
             return None
         return folders[row][0]
 
-    def on_load_file_from_global_memory(self):
-        """Pick a single file from the selected folder and inject it."""
-        from PySide6.QtWidgets import QInputDialog
-
-        folder_name = self._selected_folder_name()
-        if folder_name is None:
-            self.gui.text('Select a folder first.')
-            return
-
-        items = self.global_memory.folder_items(folder_name)
-        if not items:
-            self.gui.text(f'No items in {folder_name}.')
-            return
-
-        names = [f'{it.name}  (frame {it.frame_idx})' for it in items]
-        chosen, ok = QInputDialog.getItem(
-            self.gui, 'Load File', f'Select item from {folder_name}:',
-            names, 0, False,
-        )
-        if not ok:
-            return
-        idx = names.index(chosen)
-        n = self._inject_items([items[idx]])
-        self.gui.text(f'Injected {n} item from {folder_name}.')
-
     def on_load_folder_from_global_memory(self):
         """Inject all items from the selected folder."""
         folder_name = self._selected_folder_name()
@@ -963,6 +1054,7 @@ class MainController():
 
         items = self.global_memory.folder_items(folder_name)
         n = self._inject_items(items)
+        self._load_markers_from_global_memory()
         self.gui.text(f'Injected {n} item(s) from {folder_name}.')
 
     def on_load_all_from_global_memory(self):
@@ -972,6 +1064,7 @@ class MainController():
             self.gui.text('Global memory is empty.')
             return
         n = self._inject_items(items)
+        self._load_markers_from_global_memory()
         self.gui.text(f'Injected {n} item(s) from global memory.')
 
     def on_remove_global_memory_folder(self):
@@ -985,19 +1078,30 @@ class MainController():
         self.gui.text(f'Removed folder {folder_name}.')
 
     def _refresh_global_memory_list(self):
-        self.gui.update_global_memory_list(self.global_memory.folders())
+        video_name = os.path.basename(self.cfg['workspace'])
+        self.gui.update_global_memory_list(self.global_memory.folders(), video_name)
+
+    def _open_in_explorer(self, path):
+        import subprocess, sys
+        if sys.platform == 'darwin':
+            subprocess.Popen(['open', path])
+        elif sys.platform == 'win32':
+            subprocess.Popen(['explorer', path])
+        else:
+            subprocess.Popen(['xdg-open', path])
 
     def on_open_workspace(self):
         """Open the current workspace folder in the system file manager."""
-        import subprocess, sys
         workspace = self.cfg['workspace']
-        if sys.platform == 'darwin':
-            subprocess.Popen(['open', workspace])
-        elif sys.platform == 'win32':
-            subprocess.Popen(['explorer', workspace])
-        else:
-            subprocess.Popen(['xdg-open', workspace])
+        self._open_in_explorer(workspace)
         self.gui.text(f'Opening {workspace}')
+
+    def on_open_global_memory_folder(self, item):
+        """Open the double-clicked global memory folder in the file manager."""
+        folder_name = item.text().rsplit('(', 1)[0].strip()
+        folder_path = str(self.global_memory.store_dir / folder_name)
+        self._open_in_explorer(folder_path)
+        self.gui.text(f'Opening {folder_path}')
 
     def on_save_soft_mask_toggle(self):
         self.save_soft_mask = self.gui.save_soft_mask_checkbox.isChecked()

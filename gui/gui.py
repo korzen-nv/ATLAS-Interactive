@@ -9,12 +9,106 @@ from PySide6.QtWidgets import (QWidget, QComboBox, QCheckBox, QHBoxLayout, QLabe
                                QButtonGroup, QSlider, QRadioButton, QApplication, QFileDialog,
                                QListWidget, QListWidgetItem)
 
-from PySide6.QtGui import (QKeySequence, QShortcut, QTextCursor, QImage, QPixmap, QIcon)
-from PySide6.QtCore import Qt, QTimer, QSize
+from PySide6.QtGui import (QKeySequence, QShortcut, QTextCursor, QImage, QPixmap, QIcon, QPainter,
+                            QColor)
+from PySide6.QtCore import Qt, QTimer, QSize, QKeyCombination
 
 from gui.cutie.utils.palette import custom_palette_np, custom_names
 from gui.gui_utils import *
 from gui.ritm import controller
+
+
+class MarkerSlider(QSlider):
+    """QSlider subclass that draws markers on the groove for permanent memory frames."""
+
+    HANDLE_W = 8
+    MARKER_R = 4
+    MARKER_R_HIGHLIGHT = 6
+    HIT_RADIUS = 8  # px tolerance for hover/click detection
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._markers: set[int] = set()
+        self._marker_color = QColor(0, 200, 255)
+        self._marker_active_color = QColor(255, 255, 100)
+        self._hovered_idx: int | None = None
+        self.setMouseTracking(True)
+
+    def set_markers(self, frame_indices: set[int]):
+        self._markers = set(frame_indices)
+        self.update()
+
+    def _groove_params(self):
+        groove_left = self.HANDLE_W
+        groove_width = self.width() - 2 * self.HANDLE_W
+        return groove_left, groove_width
+
+    def _idx_to_x(self, idx):
+        span = self.maximum() - self.minimum()
+        if span == 0:
+            return None
+        groove_left, groove_width = self._groove_params()
+        return groove_left + (idx - self.minimum()) / span * groove_width
+
+    def _x_to_nearest_marker(self, x):
+        best_idx, best_dist = None, self.HIT_RADIUS + 1
+        for idx in self._markers:
+            mx = self._idx_to_x(idx)
+            if mx is None:
+                continue
+            dist = abs(x - mx)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+        return best_idx
+
+    def mouseMoveEvent(self, event):
+        old = self._hovered_idx
+        self._hovered_idx = self._x_to_nearest_marker(event.position().x())
+        if old != self._hovered_idx:
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        if self._hovered_idx is not None:
+            self._hovered_idx = None
+            self.update()
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        # if clicking on a marker, jump to that frame
+        if event.button() == Qt.MouseButton.LeftButton and self._markers:
+            clicked = self._x_to_nearest_marker(event.position().x())
+            if clicked is not None:
+                self.setValue(clicked)
+                return
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._markers:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        groove_y = self.height() // 2
+        current_val = self.value()
+
+        for idx in self._markers:
+            mx = self._idx_to_x(idx)
+            if mx is None:
+                continue
+
+            active = (idx == self._hovered_idx or idx == current_val)
+            r = self.MARKER_R_HIGHLIGHT if active else self.MARKER_R
+            color = self._marker_active_color if active else self._marker_color
+
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            painter.drawEllipse(int(mx) - r, groove_y - r, r * 2, r * 2)
+
+        painter.end()
 
 
 class GUI(QWidget):
@@ -105,7 +199,7 @@ class GUI(QWidget):
         self.frame_name.setAlignment(Qt.AlignmentFlag.AlignLeft)
 
         # timeline slider
-        self.tl_slider = QSlider(Qt.Orientation.Horizontal)
+        self.tl_slider = MarkerSlider(Qt.Orientation.Horizontal)
         self.tl_slider.valueChanged.connect(controller.on_slider_update)
         self.tl_slider.setMinimum(0)
         self.tl_slider.setMaximum(controller.T - 1)
@@ -180,11 +274,12 @@ class GUI(QWidget):
         # Global memory (cross-video exemplar pairs)
         self.global_mem_list = QListWidget()
         self.global_mem_list.setMaximumHeight(100)
+        self.global_mem_list.itemDoubleClicked.connect(controller.on_open_global_memory_folder)
 
         self.save_global_mem_button = QPushButton('Save (G)')
         self.save_global_mem_button.clicked.connect(controller.on_save_to_global_memory)
-        self.load_file_button = QPushButton('Load File')
-        self.load_file_button.clicked.connect(controller.on_load_file_from_global_memory)
+        self.save_all_global_mem_button = QPushButton('Save All')
+        self.save_all_global_mem_button.clicked.connect(controller.on_save_all_to_global_memory)
         self.load_folder_button = QPushButton('Load Folder')
         self.load_folder_button.clicked.connect(controller.on_load_folder_from_global_memory)
         self.load_all_button = QPushButton('Load All')
@@ -295,7 +390,7 @@ class GUI(QWidget):
         right_area.addWidget(self.global_mem_list)
         global_mem_buttons = QHBoxLayout()
         global_mem_buttons.addWidget(self.save_global_mem_button)
-        global_mem_buttons.addWidget(self.load_file_button)
+        global_mem_buttons.addWidget(self.save_all_global_mem_button)
         global_mem_buttons.addWidget(self.load_folder_button)
         global_mem_buttons.addWidget(self.load_all_button)
         global_mem_buttons.addWidget(self.remove_global_mem_button)
@@ -347,6 +442,23 @@ class GUI(QWidget):
         QShortcut(QKeySequence(Qt.Key.Key_Right | Qt.KeyboardModifier.AltModifier),
                     self).activated.connect(functools.partial(controller.on_next_frame, 999999))
         
+        # jump to next/prev marker
+        QShortcut(QKeySequence(Qt.Key.Key_Up), self).activated.connect(controller.on_next_marker)
+        QShortcut(QKeySequence(Qt.Key.Key_Down), self).activated.connect(controller.on_prev_marker)
+
+        # single-frame propagation
+        QShortcut(QKeySequence(Qt.Key.Key_Right | Qt.KeyboardModifier.ControlModifier),
+                    self).activated.connect(controller.on_propagate_forward_one)
+        QShortcut(QKeySequence(Qt.Key.Key_Left | Qt.KeyboardModifier.ControlModifier),
+                    self).activated.connect(controller.on_propagate_backward_one)
+
+        # 10-frame propagation
+        _ctrl_shift = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
+        QShortcut(QKeySequence(QKeyCombination(_ctrl_shift, Qt.Key.Key_Right)),
+                    self).activated.connect(functools.partial(controller.on_propagate_forward_one, 10))
+        QShortcut(QKeySequence(QKeyCombination(_ctrl_shift, Qt.Key.Key_Left)),
+                    self).activated.connect(functools.partial(controller.on_propagate_backward_one, 10))
+
         # commit to permanent memory shortcut
         QShortcut(QKeySequence(Qt.Key.Key_C), self).activated.connect(controller.on_commit)
 
@@ -544,11 +656,14 @@ class GUI(QWidget):
         self.object_color.setFixedSize(50, 30)  # Make it square
         self.object_color.setStyleSheet(f'QLabel {{ background-color: {rgb}; border: 1px solid #d3d3d3; }}')
 
-    def update_global_memory_list(self, folders):
+    def update_global_memory_list(self, folders, current_video=''):
         """Refresh the global memory list with ``[(name, count), ...]``."""
         self.global_mem_list.clear()
         for name, count in folders:
-            self.global_mem_list.addItem(f'{name}  ({count} files)')
+            item = QListWidgetItem(f'{name}  ({count} files)')
+            if name == current_video:
+                item.setForeground(QColor(0, 200, 0))
+            self.global_mem_list.addItem(item)
 
     def progressbar_update(self, progress: float):
         self.progressbar.setValue(int(progress * 100))
