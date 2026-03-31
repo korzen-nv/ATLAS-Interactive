@@ -610,6 +610,52 @@ class MainController():
         self.reset_this_interaction()
         self.show_current_frame()
 
+    def on_remove_object_all_frames(self):
+        """Remove the current object's segmentation from every frame in the workspace."""
+        if self.propagating:
+            return
+
+        from PySide6.QtWidgets import QMessageBox
+        reply = QMessageBox.question(
+            self.gui, 'Remove object from all frames',
+            f'Remove object {self.curr_object} from ALL {self.T} frames?\n'
+            'This cannot be undone.',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        obj_id = self.curr_object
+        self.gui.text(f'Removing object {obj_id} from all frames...')
+        self.gui.process_events()
+
+        modified = 0
+        for ti in range(self.T):
+            mask = self.res_man.get_mask(ti)
+            if mask is None:
+                continue
+            if not np.any(mask == obj_id):
+                continue
+            mask = mask.copy()
+            mask[mask == obj_id] = 0
+            self.res_man.save_mask(ti, mask)
+            modified += 1
+
+            if modified % 50 == 0:
+                self.gui.progressbar_update(ti / self.T)
+                self.gui.process_events()
+
+        self.gui.progressbar_update(0)
+
+        # Reload current frame to reflect changes
+        self.load_current_image_mask()
+        self.curr_prob = None
+        self.reset_this_interaction()
+        self.show_current_frame()
+
+        self.gui.text(f'Object {obj_id} removed from {modified} frame(s).')
+
     def complete_interaction(self):
         if self.interaction is not None:
             self.interaction = None
@@ -997,6 +1043,8 @@ class MainController():
         if self.vis_mode == 'davis':
             self.vis_mode = 'light'
         elif self.vis_mode == 'light':
+            self.vis_mode = 'image'
+        elif self.vis_mode == 'image':
             self.vis_mode = 'davis'
         else:
             self.vis_mode = 'davis'

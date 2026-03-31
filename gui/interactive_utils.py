@@ -83,7 +83,7 @@ def get_visualization_torch(mode: Literal['image', 'mask', 'fade', 'davis', 'lig
                                           'layer', 'rgba'], image: torch.Tensor, prob: torch.Tensor,
                             layer: torch.Tensor, target_objects: List[int]) -> np.ndarray:
     if mode == 'image':
-        return image
+        return (image.permute(1, 2, 0) * 255).byte().cpu().numpy()
     elif mode == 'mask':
         mask = torch.max(prob, dim=0).indices
         return (color_map_torch[mask] * 255).byte().cpu().numpy()

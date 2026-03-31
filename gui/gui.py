@@ -70,6 +70,8 @@ class GUI(QWidget):
         self.reset_frame_button.clicked.connect(controller.on_reset_mask)
         self.reset_object_button = QPushButton('Reset object')
         self.reset_object_button.clicked.connect(controller.on_reset_object)
+        self.remove_object_all_button = QPushButton('Remove object (all frames)')
+        self.remove_object_all_button.clicked.connect(controller.on_remove_object_all_frames)
 
         # set up the LCD
         self.lcd = QTextEdit()
@@ -113,6 +115,7 @@ class GUI(QWidget):
 
         # combobox
         self.combo = QComboBox(self)
+        self.combo.addItem("image")
         self.combo.addItem("mask")
         self.combo.addItem("davis")
         self.combo.addItem("fade")
@@ -210,6 +213,7 @@ class GUI(QWidget):
         interact_topbox.addWidget(self.play_button)
         interact_topbox.addWidget(self.reset_frame_button)
         interact_topbox.addWidget(self.reset_object_button)
+        interact_topbox.addWidget(self.remove_object_all_button)
         interact_topbox.addWidget(self.frame_name)
 
         interact_botbox.addWidget(self.object_color)
@@ -354,10 +358,10 @@ class GUI(QWidget):
         # Toggle visualization mode
         QShortcut(QKeySequence(Qt.Key.Key_T), self).activated.connect(controller.on_toggle_vis_mode)
 
-        # F1-F6: switch visualization mode directly
-        vis_modes = ['mask', 'davis', 'fade', 'light', 'popup', 'rgba']
+        # F1-F7: switch visualization mode directly
+        vis_modes = ['image', 'mask', 'davis', 'fade', 'light', 'popup', 'rgba']
         fkeys = [Qt.Key.Key_F1, Qt.Key.Key_F2, Qt.Key.Key_F3,
-                 Qt.Key.Key_F4, Qt.Key.Key_F5, Qt.Key.Key_F6]
+                 Qt.Key.Key_F4, Qt.Key.Key_F5, Qt.Key.Key_F6, Qt.Key.Key_F7]
         for key, mode in zip(fkeys, vis_modes):
             QShortcut(QKeySequence(key), self).activated.connect(
                 functools.partial(controller.set_vis_mode_direct, mode))
@@ -368,6 +372,10 @@ class GUI(QWidget):
         # save to global memory
         QShortcut(QKeySequence(Qt.Key.Key_G),
                     self).activated.connect(controller.on_save_to_global_memory)
+
+        # remove object from all frames
+        QShortcut(QKeySequence(Qt.Key.Key_D | Qt.KeyboardModifier.ShiftModifier),
+                    self).activated.connect(controller.on_remove_object_all_frames)
 
         # undo last mask edit
         QShortcut(QKeySequence(Qt.Key.Key_Z | Qt.KeyboardModifier.ControlModifier),
