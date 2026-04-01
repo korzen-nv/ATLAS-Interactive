@@ -105,6 +105,7 @@ def create_backends(
     image_dir: Optional[str] = None,
     *,
     shared_model=None,
+    torch_rt=None,
 ) -> Tuple[PropagationBackend, ClickBackend]:
     """Create propagation + click backends based on ``cfg.backend``.
 
@@ -114,6 +115,8 @@ def create_backends(
         image_dir: Path to workspace JPEG frames directory (required for SAM).
         shared_model: Pre-loaded model object to avoid reloading weights
             (used by the web server where the model is loaded once at startup).
+        torch_rt: Optional :class:`~gui.torch_rt.TorchRT` instance for
+            compiled resize operations.
 
     Returns:
         ``(propagation_backend, click_backend)`` tuple.
@@ -122,7 +125,7 @@ def create_backends(
     log.info(f"Initialising backend: {backend_name}")
 
     if backend_name == 'cutie':
-        return _create_cutie(cfg, device, shared_model)
+        return _create_cutie(cfg, device, shared_model, torch_rt=torch_rt)
     elif backend_name == 'sam2':
         return _create_sam2(cfg, device, image_dir, shared_model)
     elif backend_name == 'sam3':
@@ -138,9 +141,12 @@ def create_backends(
 
 # -- CUTIE + RITM -------------------------------------------------------------
 
-def _create_cutie(cfg, device, shared_model):
+def _create_cutie(cfg, device, shared_model, *, torch_rt=None):
     from gui.backends.cutie_backend import CutieBackend, RitmClickBackend
     from gui.cutie.utils.download_models import download_models_if_needed
+
+    trt_encoder = None
+    trt_mask_decoder = None
 
     if shared_model is not None:
         cutie = shared_model
@@ -151,18 +157,59 @@ def _create_cutie(cfg, device, shared_model):
         weights = torch.load(cfg.weights, map_location=device)
         cutie.load_weights(weights)
 
-        # GPU optimisation: FP8 weight quantize, then torch.compile
-        # Only compile encoder + key projection — mask_encoder/mask_decoder
-        # use group ops with F.interpolate (adaptive_avg_pool2d) that the
-        # inductor cannot lower with dynamic spatial dimensions.
-        cutie = _apply_fp8(cutie, cfg)
-        _apply_torch_compile(cutie, cfg, submodules=[
-            'pixel_encoder', 'key_proj',
-        ])
+        # --- TRT engines (must happen BEFORE FP8 / torch.compile) ---
+        if torch_rt is not None and cfg.get('tensorrt', True):
+            trt_encoder, trt_mask_decoder = _try_build_trt(
+                cutie, cfg, torch_rt, device)
 
-    propagation = CutieBackend(cutie, cfg)
+        # GPU optimisation: FP8 weight quantize, then torch.compile
+        cutie = _apply_fp8(cutie, cfg)
+        if trt_encoder is None:
+            _apply_torch_compile(cutie, cfg, submodules=[
+                'pixel_encoder', 'key_proj',
+            ])
+
+    propagation = CutieBackend(cutie, cfg, torch_rt=torch_rt,
+                               trt_encoder=trt_encoder,
+                               trt_mask_decoder=trt_mask_decoder)
     click = RitmClickBackend(cfg.ritm_weights, device=device)
     return propagation, click
+
+
+def _get_padded_hw(cfg, torch_rt):
+    """Compute the padded internal resolution that InferenceCore will use."""
+    mis = cfg.get('max_internal_size', 0)
+    if mis > 0 and torch_rt.needs_resize(mis):
+        ih, iw = torch_rt.internal_hw(mis)
+    else:
+        ih, iw = torch_rt.canvas_h, torch_rt.canvas_w
+    ph = ih + (16 - ih % 16) % 16
+    pw = iw + (16 - iw % 16) % 16
+    return ph, pw
+
+
+def _try_build_trt(cutie, cfg, torch_rt, device):
+    """Attempt to build TRT engines for the CUTIE encoder + mask decoder."""
+    try:
+        from gui.trt_engine import TRTEncoder, TRTMaskDecoder
+    except ImportError:
+        return None, None
+
+    ph, pw = _get_padded_hw(cfg, torch_rt)
+    weights_path = cfg.get('weights', '')
+    fp16 = cfg.get('amp', True)
+
+    trt_encoder = TRTEncoder.build(
+        cutie, (ph, pw),
+        weights_path=weights_path, fp16=fp16, device=device,
+    )
+
+    trt_mask_decoder = TRTMaskDecoder.build(
+        cutie, (ph, pw), cfg.num_objects,
+        weights_path=weights_path, fp16=fp16, device=device,
+    )
+
+    return trt_encoder, trt_mask_decoder
 
 
 # -- SAM 2 --------------------------------------------------------------------

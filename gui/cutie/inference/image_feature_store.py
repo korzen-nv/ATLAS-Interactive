@@ -13,15 +13,20 @@ class ImageFeatureStore:
 
     Feature of a frame should be associated with a unique index -- typically the frame id.
     """
-    def __init__(self, network: CUTIE, no_warning: bool = False):
+    def __init__(self, network: CUTIE, no_warning: bool = False, trt_encoder=None):
         self.network = network
         self._store = {}
         self.no_warning = no_warning
+        self._trt_encoder = trt_encoder
 
     def _encode_feature(self, index: int, image: torch.Tensor) -> None:
-        ms_features, pix_feat = self.network.encode_image(image)
-        key, shrinkage, selection = self.network.transform_key(ms_features[0])
-        self._store[index] = (ms_features, pix_feat, key, shrinkage, selection)
+        if self._trt_encoder is not None and image.shape[0] == 1:
+            f16, f8, f4, pix_feat, key, shrinkage, selection = self._trt_encoder(image)
+            self._store[index] = ((f16, f8, f4), pix_feat, key, shrinkage, selection)
+        else:
+            ms_features, pix_feat = self.network.encode_image(image)
+            key, shrinkage, selection = self.network.transform_key(ms_features[0])
+            self._store[index] = (ms_features, pix_feat, key, shrinkage, selection)
 
     def get_features(self, index: int,
                      image: torch.Tensor) -> (Iterable[torch.Tensor], torch.Tensor):

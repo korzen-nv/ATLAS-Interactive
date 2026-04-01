@@ -143,10 +143,8 @@ class MemoryManager:
                     [self.long_mem.shrinkage[bucket_id], self.work_mem.shrinkage[bucket_id]], -1)
 
                 similarity = get_similarity(memory_key, shrinkage, query_key, selection)
-                affinity, usage = do_softmax(similarity,
-                                             top_k=self.top_k,
-                                             inplace=True,
-                                             return_usage=True)
+                topk_weights, topk_indices, usage = do_softmax_sparse(
+                    similarity, top_k=self.top_k, return_usage=True)
                 """
                 Record memory usage for working and long-term memory
                 """
@@ -165,13 +163,12 @@ class MemoryManager:
                 similarity = get_similarity(memory_key, shrinkage, query_key, selection)
 
                 if self.use_long_term:
-                    affinity, usage = do_softmax(similarity,
-                                                 top_k=self.top_k,
-                                                 inplace=True,
-                                                 return_usage=True)
+                    topk_weights, topk_indices, usage = do_softmax_sparse(
+                        similarity, top_k=self.top_k, return_usage=True)
                     self.work_mem.update_bucket_usage(bucket_id, usage)
                 else:
-                    affinity = do_softmax(similarity, top_k=self.top_k, inplace=True)
+                    topk_weights, topk_indices = do_softmax_sparse(
+                        similarity, top_k=self.top_k)
 
             if self.chunk_size < 1:
                 object_chunks = [bucket]
@@ -184,8 +181,9 @@ class MemoryManager:
                 this_sensory = self._get_sensory_by_ids(objects)
                 this_last_mask = self._get_mask_by_ids(last_mask, objects)
                 this_msk_value = self._get_visual_values_by_ids(objects)  # (1/2)*num_objects*C*N
-                visual_readout = self._readout(affinity,
-                                               this_msk_value).view(bs, len(objects), self.CV, h, w)
+                visual_readout = sparse_readout(
+                    this_msk_value, topk_indices, topk_weights,
+                ).view(bs, len(objects), self.CV, h, w)
                 pixel_readout = network.pixel_fusion(pix_feat, visual_readout, this_sensory,
                                                      this_last_mask)
                 this_obj_mem = self._get_object_mem_by_ids(objects)
