@@ -539,11 +539,16 @@ class MainController():
     def update_canvas(self):
         self.gui.set_canvas(self.vis_image)
 
+    def _vis_alpha(self) -> float:
+        """Return the blend alpha for the current visualization mode."""
+        if self.vis_mode == 'light':
+            return 0.9
+        return 0.5
+
     def update_current_image_fast(self, invalid_soft_mask: bool = False):
-        # fast path, uses gpu. Changes the image in-place to avoid copying
-        # thus current_image_torch must be voided afterwards
+        # fast path, uses gpu.
         # do_no_save_soft_mask is an override to solve #41
-        # Apply class power weights to visualization so the preview matches the saved mask
+        # Apply class power weights to visualization so the preview matches the saved mask.
         vis_prob = self.curr_prob
         if self._has_non_default_class_power() and vis_prob is not None:
             w = self._effective_weights().to(vis_prob.device).view(-1, 1, 1)
@@ -551,6 +556,31 @@ class MainController():
                 vis_prob = vis_prob.clamp(min=1e-7) ** w
             else:
                 vis_prob = vis_prob * w
+
+        # GPU-direct display path (no CPU roundtrip).
+        if self.gui._gl_canvas_active:
+            self.gui.set_canvas_gpu(
+                self.curr_image_torch, vis_prob,
+                self.vis_mode, self.vis_target_objects,
+                alpha=self._vis_alpha(),
+                overlay_tensor=self.overlay_layer_torch)
+
+            save_visualization = self.save_visualization_mode in [
+                'Propagation only (higher quality)', 'Always'
+            ]
+            if save_visualization and not invalid_soft_mask:
+                self.vis_image = get_visualization_torch(
+                    self.vis_mode, self.curr_image_torch.clone(),
+                    vis_prob, self.overlay_layer_torch,
+                    self.vis_target_objects,
+                    selected_obj=self.curr_object)
+                self.vis_image = np.ascontiguousarray(self.vis_image)
+                self.res_man.save_visualization(self.curr_ti, self.vis_mode, self.vis_image)
+            if self.save_soft_mask and not invalid_soft_mask:
+                self.res_man.save_soft_mask(self.curr_ti, self.curr_prob.cpu().numpy())
+            return
+
+        # Legacy CPU path: torch overlay functions mutate image in-place.
         self.vis_image = get_visualization_torch(self.vis_mode, self.curr_image_torch,
                                                  vis_prob, self.overlay_layer_torch,
                                                  self.vis_target_objects,
@@ -568,11 +598,29 @@ class MainController():
             self.vis_image = self._apply_mask_diff(self.vis_image)
         self.gui.set_canvas(self.vis_image)
 
+    def _has_cpu_overlays(self) -> bool:
+        """True if any CPU-side overlays are active (heatmap, brush cursor)."""
+        if self._show_change_heatmap and self.curr_ti in self._change_heatmaps:
+            return True
+        return False
+
     def show_current_frame(self, fast: bool = False, invalid_soft_mask: bool = False):
         # Re-compute overlay and show the image
         if fast:
             self.update_current_image_fast(invalid_soft_mask)
+        elif self.gui._gl_canvas_active and not self._has_cpu_overlays():
+            # GL numpy path: upload image + mask as textures, shader composites
+            self.gui.set_canvas_numpy_gpu(
+                self.curr_image_np, self.curr_mask,
+                self.vis_mode, self.vis_target_objects,
+                alpha=self._vis_alpha(),
+                overlay_np=self.overlay_layer)
+            if self.save_visualization_mode == 'Always':
+                # Materialize for disk save
+                self.compose_current_im()
+                self.res_man.save_visualization(self.curr_ti, self.vis_mode, self.vis_image)
         else:
+            # Legacy CPU path (brush cursor, heatmap, or no GL)
             self.compose_current_im()
             if self.save_visualization_mode == 'Always':
                 self.res_man.save_visualization(self.curr_ti, self.vis_mode, self.vis_image)
