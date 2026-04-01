@@ -214,7 +214,7 @@ class TRTEncoder:
         w_mtime = ""
         if weights_path and os.path.exists(weights_path):
             w_mtime = str(int(os.path.getmtime(weights_path)))
-        key_str = f"{h}x{w}_{gpu_name}_trt{trt.__version__}_{w_mtime}"
+        key_str = f"enc_{h}x{w}_fp{int(fp16)}_{gpu_name}_trt{trt.__version__}_{w_mtime}"
         key_hash = hashlib.sha256(key_str.encode()).hexdigest()[:16]
 
         if cache_dir is None:
@@ -577,7 +577,8 @@ class TRTMaskDecoder:
         if weights_path and os.path.exists(weights_path):
             w_mtime = str(int(os.path.getmtime(weights_path)))
         key_str = (
-            f"maskdec_{h}x{w}_no{NO}_{gpu_name}_trt{trt.__version__}_{w_mtime}"
+            f"maskdec_{h}x{w}_no{NO}_fp{int(fp16)}"
+            f"_{gpu_name}_trt{trt.__version__}_{w_mtime}"
         )
         key_hash = hashlib.sha256(key_str.encode()).hexdigest()[:16]
 
@@ -638,11 +639,115 @@ READOUT_INPUT_NAMES = [
 READOUT_OUTPUT_NAMES = ["readout"]
 
 
+def _manual_mha(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    mha: nn.MultiheadAttention,
+    attn_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Multi-head attention using explicit matmul + softmax (ONNX-safe).
+
+    Replaces ``nn.MultiheadAttention.forward`` which doesn't survive
+    ONNX → TRT conversion when boolean/float-inf masks are involved.
+
+    Args:
+        q, k, v: (B, seq_len, embed_dim) — batch_first format
+        mha: the original nn.MultiheadAttention (weights are read from it)
+        attn_mask: (B*num_heads, q_len, kv_len) float additive mask (0 or -inf)
+
+    Returns:
+        (B, q_len, embed_dim)
+    """
+    E = mha.embed_dim
+    NH = mha.num_heads
+    HD = E // NH
+    B = q.shape[0]
+
+    # Project Q, K, V using the MHA's combined in_proj_weight/bias
+    W = mha.in_proj_weight  # (3E, E)
+    bias = mha.in_proj_bias  # (3E,)
+    Wq, Wk, Wv = W[:E], W[E : 2 * E], W[2 * E :]
+    bq, bk, bv = bias[:E], bias[E : 2 * E], bias[2 * E :]
+
+    Q = F.linear(q, Wq, bq)  # (B, q_len, E)
+    K = F.linear(k, Wk, bk)  # (B, kv_len, E)
+    V = F.linear(v, Wv, bv)  # (B, kv_len, E)
+
+    # Reshape to (B, NH, seq, HD)
+    Q = Q.view(B, -1, NH, HD).transpose(1, 2)
+    K = K.view(B, -1, NH, HD).transpose(1, 2)
+    V = V.view(B, -1, NH, HD).transpose(1, 2)
+
+    # Scaled dot-product attention
+    scale = HD ** -0.5
+    scores = torch.matmul(Q, K.transpose(-2, -1)) * scale  # (B, NH, q_len, kv_len)
+
+    if attn_mask is not None:
+        # attn_mask: (B*NH, q_len, kv_len) → (B, NH, q_len, kv_len)
+        scores = scores + attn_mask.view(B, NH, scores.shape[2], scores.shape[3])
+
+    attn = torch.softmax(scores, dim=-1)
+    out = torch.matmul(attn, V)  # (B, NH, q_len, HD)
+
+    # Reshape back and project
+    out = out.transpose(1, 2).contiguous().view(B, -1, E)  # (B, q_len, E)
+    out = F.linear(out, mha.out_proj.weight, mha.out_proj.bias)
+    return out
+
+
+def _manual_cross_attn(
+    x: torch.Tensor,
+    mem: torch.Tensor,
+    x_pe: torch.Tensor,
+    mem_pe: torch.Tensor,
+    cross_attn_mod: nn.Module,
+    attn_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """CrossAttention.forward reimplemented with _manual_mha."""
+    x = cross_attn_mod.norm(x)
+    cfg = cross_attn_mod.add_pe_to_qkv
+    q = (x + x_pe) if cfg[0] else x
+    if any(cfg[1:]):
+        mem_with_pe = mem + mem_pe
+        k = mem_with_pe if cfg[1] else mem
+        v = mem_with_pe if cfg[2] else mem
+    else:
+        k = v = mem
+    r = x
+    out = _manual_mha(q, k, v, cross_attn_mod.cross_attn, attn_mask=attn_mask)
+    if cross_attn_mod.residual:
+        return r + out
+    else:
+        return out
+
+
+def _manual_self_attn(
+    x: torch.Tensor,
+    pe: torch.Tensor,
+    self_attn_mod: nn.Module,
+) -> torch.Tensor:
+    """SelfAttention.forward reimplemented with _manual_mha."""
+    x = self_attn_mod.norm(x)
+    cfg = self_attn_mod.add_pe_to_qkv
+    if any(cfg):
+        x_pe = x + pe
+        q = x_pe if cfg[0] else x
+        k = x_pe if cfg[1] else x
+        v = x_pe if cfg[2] else x
+    else:
+        q = k = v = x
+    r = x
+    out = _manual_mha(q, k, v, self_attn_mod.self_attn)
+    return r + out
+
+
 class _ReadoutPipelineONNXWrapper(nn.Module):
     """Combines pixel_fusion + object_transformer for ONNX export.
 
-    Fixed ``num_objects`` and spatial dims.  Precomputes positional encoding
-    and replaces ``_get_aux_mask``'s ``torch.where`` with static-shape ops.
+    Fixed ``num_objects`` and spatial dims.  Precomputes positional encoding.
+    Uses manual matmul+softmax attention instead of ``nn.MultiheadAttention``
+    which doesn't survive ONNX → TRT conversion with masked attention.
     """
 
     def __init__(
@@ -664,18 +769,19 @@ class _ReadoutPipelineONNXWrapper(nn.Module):
         self.summary_to_query_emb = qt.summary_to_query_emb
         self.pixel_init_proj = qt.pixel_init_proj
         self.pixel_emb_proj = qt.pixel_emb_proj
-        self.blocks = qt.blocks
         self.mask_pred = qt.mask_pred
         self.num_heads = qt.num_heads
         self.num_queries = qt.num_queries
         self.embed_dim = qt.embed_dim
 
+        # Store transformer block sub-modules (for manual attention)
+        self.blocks = qt.blocks
+
         # Precompute spatial positional encoding with batch=num_objects
-        # (avoids dynamic arange/cache in ONNX export)
         with torch.no_grad():
             dev = next(cutie.parameters()).device
             dummy = torch.zeros(num_objects, qt.embed_dim, h16, w16, device=dev)
-            pe = qt.spatial_pe(dummy)  # (num_objects, h16, w16, embed_dim)
+            pe = qt.spatial_pe(dummy)
         self.register_buffer("pixel_pe_const", pe)
 
     def forward(
@@ -686,38 +792,26 @@ class _ReadoutPipelineONNXWrapper(nn.Module):
         last_mask_ds: torch.Tensor,
         obj_summaries: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        pix_feat:        (1, 256, H16, W16)
-        visual_readout:  (1, NO, 256, H16, W16)
-        sensory:         (1, NO, 256, H16, W16)
-        last_mask_ds:    (1, NO, H16, W16) — already downsampled to stride 16
-        obj_summaries:   (1, NO, 1, 16, 257) — object memory (T=1)
-
-        Returns:
-            readout: (1, NO, 256, H16, W16)
-        """
         NO = self.NO
 
         # ==================== PixelFeatureFuser ====================
-        # _get_others: for each object, sum of all other objects' masks
         last_others = (
             last_mask_ds.sum(1, keepdim=True) - last_mask_ds
         ).clamp(0, 1)
-        mask_ch = torch.stack([last_mask_ds, last_others], dim=2)  # (1,NO,2,H,W)
+        mask_ch = torch.stack([last_mask_ds, last_others], dim=2)
 
-        sensory_in = torch.cat([sensory, mask_ch], dim=2)  # (1,NO,258,H,W)
-        sensory_rd = self.sensory_compress(sensory_in)  # (1,NO,256,H,W)
+        sensory_in = torch.cat([sensory, mask_ch], dim=2)
+        sensory_rd = self.sensory_compress(sensory_in)
         p16 = visual_readout + sensory_rd
-        p16 = self.fuser(pix_feat, p16)  # (1,NO,256,H,W)
+        p16 = self.fuser(pix_feat, p16)
 
         # ==================== QueryTransformer ====================
         pixel = p16
         H, W = pixel.shape[3], pixel.shape[4]
 
-        # --- query initialisation from obj_summaries (T=1) ---
         osf = obj_summaries.view(NO, 1, self.num_queries, self.embed_dim + 1)
-        obj_sums = osf[:, 0, :, :-1]  # (NO, 16, 256)
-        obj_area = osf[:, 0, :, -1:]  # (NO, 16, 1)
+        obj_sums = osf[:, 0, :, :-1]
+        obj_area = osf[:, 0, :, -1:]
         obj_values = obj_sums / (obj_area + 1e-4)
 
         query = (
@@ -729,11 +823,10 @@ class _ReadoutPipelineONNXWrapper(nn.Module):
             + self.summary_to_query_emb(obj_values)
         )
 
-        # --- pixel projections + PE ---
         pixel_init = self.pixel_init_proj(pixel)
         pixel_emb = self.pixel_emb_proj(pixel)
 
-        pixel_pe = self.pixel_pe_const.flatten(1, 2)  # (NO, H*W, embed_dim)
+        pixel_pe = self.pixel_pe_const.flatten(1, 2)
         pixel_emb_flat = (
             pixel_emb.flatten(3, 4).flatten(0, 1).transpose(1, 2).contiguous()
         )
@@ -741,37 +834,41 @@ class _ReadoutPipelineONNXWrapper(nn.Module):
 
         pixel = pixel_init
 
-        # --- transformer blocks ---
-        aux_logits = self.mask_pred[0](pixel).squeeze(2)  # (1,NO,H,W)
+        # --- transformer blocks (manual attention) ---
+        aux_logits = self.mask_pred[0](pixel).squeeze(2)
         attn_mask = self._aux_mask(aux_logits, H, W)
 
         for i in range(len(self.blocks)):
-            query, pixel, _, _ = self.blocks[i](
-                query, pixel, query_emb, pixel_pe, attn_mask, need_weights=False
+            blk = self.blocks[i]
+            pixel_flat = pixel.flatten(3, 4).flatten(0, 1).transpose(1, 2).contiguous()
+            query = _manual_cross_attn(
+                query, pixel_flat, query_emb, pixel_pe,
+                blk.read_from_pixel, attn_mask=attn_mask,
             )
+            query = _manual_self_attn(query, query_emb, blk.self_attn)
+            query = blk.ffn(query)
+            pixel_flat = _manual_cross_attn(
+                pixel_flat, query, pixel_pe, query_emb,
+                blk.read_from_query,
+            )
+            pixel = blk.pixel_ffn(pixel, pixel_flat)
             aux_logits = self.mask_pred[i + 1](pixel).squeeze(2)
             attn_mask = self._aux_mask(aux_logits, H, W)
 
-        return pixel  # (1, NO, 256, H16, W16)
+        return pixel
 
-    # ----------------------------------------------------------------
     def _aux_mask(
         self, logits: torch.Tensor, H: int, W: int
     ) -> torch.Tensor:
-        """Static-shape replacement for QueryTransformer._get_aux_mask.
+        """Float additive attention mask from intermediate predictions."""
+        prob = logits.sigmoid()
 
-        Uses ``& ~all_masked`` instead of ``torch.where`` to avoid
-        variable-length indexing that TRT cannot handle.
-        """
-        prob = logits.sigmoid()  # (1, NO, H, W)
-
-        # aggregate: background = prod(1-p), then log-odds
         bg = torch.prod(1 - prob, dim=1, keepdim=True)
         all_p = torch.cat([bg, prob], dim=1).clamp(1e-7, 1 - 1e-7)
         lo = torch.log(all_p / (1 - all_p + 1e-7))
 
-        is_fg = lo[:, 1:] >= lo.max(dim=1, keepdim=True)[0]  # (1,NO,H,W)
-        fg_flat = is_fg.flatten(2)  # (1, NO, H*W)
+        is_fg = lo[:, 1:] >= lo.max(dim=1, keepdim=True)[0]
+        fg_flat = is_fg.flatten(2)
         inv_fg = ~fg_flat
         inv_bg = fg_flat
 
@@ -779,20 +876,16 @@ class _ReadoutPipelineONNXWrapper(nn.Module):
         NQ2 = self.num_queries // 2
         HW = H * W
 
-        # (1, NO, NH, NQ//2, HW)
         m_fg = inv_fg.unsqueeze(2).unsqueeze(2).expand(-1, -1, NH, NQ2, HW)
         m_bg = inv_bg.unsqueeze(2).unsqueeze(2).expand(-1, -1, NH, NQ2, HW)
-        aux = torch.cat([m_fg, m_bg], dim=3)  # (1,NO,NH,NQ,HW)
-        aux = aux.reshape(-1, self.num_queries, HW)  # (NO*NH,NQ,HW)
+        aux = torch.cat([m_fg, m_bg], dim=3)
+        aux = aux.reshape(-1, self.num_queries, HW)
 
-        # Un-block queries where ALL spatial positions are masked
+        # Un-block fully-masked queries
         all_blocked = aux.sum(-1, keepdim=True) == HW
         aux = aux & ~all_blocked
 
-        # Convert boolean → float additive mask for ONNX compatibility.
-        # nn.MultiheadAttention does this internally in PyTorch, but the
-        # conversion may not survive ONNX export correctly.
-        # True (blocked) → -inf,  False (allowed) → 0.0
+        # Boolean → float additive mask: True → -inf, False → 0
         float_mask = torch.zeros(
             aux.shape, dtype=torch.float32, device=aux.device
         )
@@ -866,9 +959,11 @@ class TRTReadout:
             outputs[name] = torch.empty(shape, dtype=dtype, device=self._device)
 
         for name, tensor in inputs.items():
-            self._context.set_tensor_address(name, tensor.data_ptr())
+            if not self._context.set_tensor_address(name, tensor.data_ptr()):
+                raise RuntimeError(f"TRTReadout: failed to bind input '{name}'")
         for name, tensor in outputs.items():
-            self._context.set_tensor_address(name, tensor.data_ptr())
+            if not self._context.set_tensor_address(name, tensor.data_ptr()):
+                raise RuntimeError(f"TRTReadout: failed to bind output '{name}'")
 
         stream = torch.cuda.current_stream(self._device)
         ok = self._context.execute_async_v3(stream.cuda_stream)
@@ -904,7 +999,8 @@ class TRTReadout:
         if weights_path and os.path.exists(weights_path):
             w_mtime = str(int(os.path.getmtime(weights_path)))
         key_str = (
-            f"readout_{h}x{w}_no{NO}_{gpu_name}_trt{trt.__version__}_{w_mtime}"
+            f"readout_{h}x{w}_no{NO}_fp{int(fp16)}"
+            f"_{gpu_name}_trt{trt.__version__}_{w_mtime}"
         )
         key_hash = hashlib.sha256(key_str.encode()).hexdigest()[:16]
 
