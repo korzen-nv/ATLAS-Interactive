@@ -441,6 +441,15 @@ class MainController():
 
         with autocast(self.device, enabled=(self.amp and self.device == 'cuda')):
             if action in ['left', 'right']:
+                # RMB on a different class's mask: temporarily switch to that class
+                # so the negative point removes its mask, then switch back
+                original_object = None
+                if action == 'right':
+                    obj_at_click = int(self.curr_mask[int(y), int(x)])
+                    if obj_at_click > 0 and obj_at_click != self.curr_object:
+                        original_object = self.curr_object
+                        self.curr_object = obj_at_click
+
                 self.convert_current_image_mask_torch()
                 image = self.curr_image_torch
                 if (last_interaction is None or last_interaction.tar_obj != self.curr_object):
@@ -455,6 +464,12 @@ class MainController():
                 self.interacted_prob = self.interaction.predict().to(self.device, non_blocking=True)
                 self.update_interacted_mask()
                 self.update_gpu_gauges()
+
+                # Restore original class after removing a different class's mask
+                if original_object is not None:
+                    self.curr_object = original_object
+                    self.complete_interaction()
+                    self.click_ctrl.unanchor()
 
     def load_current_image_mask(self, no_mask: bool = False):
         self.curr_image_np = self.res_man.get_image(self.curr_ti)
@@ -860,14 +875,15 @@ class MainController():
         self.show_current_frame()
 
     def on_remove_object_all_frames(self):
-        """Remove the current object's segmentation from every frame in the workspace."""
+        """Remove the current object's segmentation from current frame to end of video."""
         if self.propagating:
             return
 
         from PySide6.QtWidgets import QMessageBox
+        remaining = self.T - self.curr_ti
         reply = QMessageBox.question(
-            self.gui, 'Remove object from all frames',
-            f'Remove object {self.curr_object} from ALL {self.T} frames?\n'
+            self.gui, 'Remove object from here to end',
+            f'Remove object {self.curr_object} from frame {self.curr_ti} to end ({remaining} frames)?\n'
             'This cannot be undone.',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -876,11 +892,11 @@ class MainController():
             return
 
         obj_id = self.curr_object
-        self.gui.text(f'Removing object {obj_id} from all frames...')
+        self.gui.text(f'Removing object {obj_id} from frame {self.curr_ti} to end...')
         self.gui.process_events()
 
         modified = 0
-        for ti in range(self.T):
+        for ti in range(self.curr_ti, self.T):
             mask = self.res_man.get_mask(ti)
             if mask is None:
                 continue
@@ -892,7 +908,7 @@ class MainController():
             modified += 1
 
             if modified % 50 == 0:
-                self.gui.progressbar_update(ti / self.T)
+                self.gui.progressbar_update((ti - self.curr_ti) / remaining)
                 self.gui.process_events()
 
         self.gui.progressbar_update(0)
@@ -903,7 +919,7 @@ class MainController():
         self.reset_this_interaction()
         self.show_current_frame()
 
-        self.gui.text(f'Object {obj_id} removed from {modified} frame(s).')
+        self.gui.text(f'Object {obj_id} removed from {modified} frame(s) (frame {self.curr_ti} to end).')
 
     def complete_interaction(self):
         if self.interaction is not None:
