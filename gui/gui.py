@@ -289,15 +289,26 @@ class GUI(QWidget):
 
         self.combo.setCurrentText('None')
 
-        # Main canvas -> QLabel
-        self.main_canvas = QLabel()
-        self.main_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.main_canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.main_canvas.setMinimumSize(100, 100)
+        # Main canvas — try GL widget, fall back to QLabel
+        self._gl_canvas_active = False
+        try:
+            from gui.gl_canvas import GLCanvasWidget
+            from gui.interactive_utils import color_map_np
+            self.main_canvas = GLCanvasWidget(
+                self.h, self.w, controller.num_objects, color_map_np, parent=self)
+            self._gl_canvas_active = True
+            print("Using OpenGL canvas (CUDA-GL interop enabled)")
+        except Exception as e:
+            print(f"GL canvas unavailable ({e}), falling back to QLabel")
+            self.main_canvas = QLabel()
+            self.main_canvas.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            self.main_canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.main_canvas.setMinimumSize(100, 100)
 
         self.main_canvas.mousePressEvent = self.on_mouse_press
         self.main_canvas.mouseMoveEvent = self.on_mouse_motion
-        self.main_canvas.setMouseTracking(True)  # Required for all-time tracking
+        self.main_canvas.setMouseTracking(True)
         self.main_canvas.mouseReleaseEvent = self.on_mouse_release
 
         # clearing memory
@@ -638,6 +649,10 @@ class GUI(QWidget):
         self.console.insertPlainText(text + '\n')
 
     def set_canvas(self, image):
+        if self._gl_canvas_active:
+            self.main_canvas.set_canvas(image)
+            return
+
         height, width, channel = image.shape
         # if the image is RGBA, convert to RGB first by coloring the background green
         if channel == 4:
@@ -659,11 +674,39 @@ class GUI(QWidget):
         self.main_canvas_size = self.main_canvas.size()
         self.image_size = qImg.size()
 
+    def set_canvas_gpu(self, image_tensor, prob_tensor, mode, target_objects,
+                       alpha=0.5, overlay_tensor=None):
+        """GPU-direct display path via CUDA-GL interop."""
+        if self._gl_canvas_active:
+            self.main_canvas.update_from_gpu(
+                image_tensor, prob_tensor, mode, target_objects,
+                alpha=alpha, overlay_tensor=overlay_tensor)
+        else:
+            # Fallback to CPU path
+            from gui.interactive_utils import get_visualization_torch
+            vis = get_visualization_torch(mode, image_tensor, prob_tensor,
+                                          overlay_tensor, target_objects)
+            self.set_canvas(vis)
+
+    def set_canvas_numpy_gpu(self, image_np, mask_np, mode, target_objects,
+                             alpha=0.5, overlay_np=None):
+        """Numpy upload to GL path (scrubbing)."""
+        if self._gl_canvas_active:
+            self.main_canvas.update_from_numpy(
+                image_np, mask_np, mode, target_objects,
+                alpha=alpha, overlay_np=overlay_np)
+        else:
+            from gui.interactive_utils import get_visualization
+            vis = get_visualization(mode, image_np, mask_np, overlay_np, target_objects)
+            self.set_canvas(vis)
+
     def update_slider(self, value):
         self.lcd.setText('{: 3d} / {: 3d}'.format(value, self.controller.T - 1))
         self.tl_slider.setValue(value)
 
     def pixel_pos_to_image_pos(self, x, y):
+        if self._gl_canvas_active:
+            return self.main_canvas.pixel_pos_to_image_pos(x, y)
         # Un-scale and un-pad the label coordinates into image coordinates
         oh, ow = self.image_size.height(), self.image_size.width()
         nh, nw = self.main_canvas_size.height(), self.main_canvas_size.width()
@@ -684,6 +727,8 @@ class GUI(QWidget):
         return x, y
 
     def is_pos_out_of_bound(self, x, y):
+        if self._gl_canvas_active:
+            return self.main_canvas.is_pos_out_of_bound(x, y)
         x, y = self.pixel_pos_to_image_pos(x, y)
 
         out_of_bound = ((x < 0) or (y < 0) or (x > self.w - 1) or (y > self.h - 1))
@@ -691,6 +736,8 @@ class GUI(QWidget):
         return out_of_bound
 
     def get_scaled_pos(self, x, y):
+        if self._gl_canvas_active:
+            return self.main_canvas.get_scaled_pos(x, y)
         x, y = self.pixel_pos_to_image_pos(x, y)
 
         x = max(0, min(self.w - 1, x))

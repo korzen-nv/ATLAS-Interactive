@@ -1484,6 +1484,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pyopengl"
+version = "3.1.10"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6f/16/912b7225d56284859cd9a672827f18be43f8012f8b7b932bc4bd959a298e/pyopengl-3.1.10.tar.gz", hash = "sha256:c4a02d6866b54eb119c8e9b3fb04fa835a95ab802dd96607ab4cdb0012df8335", size = 1915580, upload-time = "2025-08-18T02:33:01.76Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/de/e4/1ba6f44e491c4eece978685230dde56b14d51a0365bc1b774ddaa94d14cd/pyopengl-3.1.10-py3-none-any.whl", hash = "sha256:794a943daced39300879e4e47bd94525280685f42dbb5a998d336cfff151d74f", size = 3194996, upload-time = "2025-08-18T02:32:59.902Z" },
+]
+
+[[package]]
 name = "pyqtdarktheme"
 version = "2.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2029,6 +2038,7 @@ dependencies = [
     { name = "psutil" },
     { name = "pycocotools" },
     { name = "pydensecrf2" },
+    { name = "pyopengl" },
     { name = "pyqtdarktheme" },
     { name = "pyside6" },
     { name = "requests" },
@@ -2069,6 +2079,7 @@ requires-dist = [
     { name = "psutil", specifier = ">=7.2.2" },
     { name = "pycocotools", specifier = ">=2.0.7" },
     { name = "pydensecrf2", specifier = ">=1.0" },
+    { name = "pyopengl", specifier = ">=3.1.10" },
     { name = "pyqtdarktheme" },
     { name = "pyqtdarktheme", marker = "extra == 'desktop'" },
     { name = "pyside6", specifier = ">=6.2.0" },
