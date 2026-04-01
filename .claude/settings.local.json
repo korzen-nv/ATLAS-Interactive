@@ -24,7 +24,8 @@
       "Bash(find /home/pkorzeniowsk/Projects -path *surgnet* -name *.py -type f)",
       "Bash(find /home/pkorzeniowsk/Projects/atlas/ATLAS-Interactive -name *.ui -o -name *config* -type f)",
       "Bash(find /home/pkorzeniowsk/Projects/atlas/ATLAS-Interactive -type f \\\\\\(-name *.qrc -o -name *.rcc -o -name *.ui -o -name *resource* \\\\\\))",
-      "Bash(grep -r \"prev_mask\\\\|prev_mask_to_logits\" /home/pkorzeniowsk/Projects/atlas/ATLAS-Interactive/gui/backends/*.py)"
+      "Bash(grep -r \"prev_mask\\\\|prev_mask_to_logits\" /home/pkorzeniowsk/Projects/atlas/ATLAS-Interactive/gui/backends/*.py)",
+      "WebFetch(domain:github.com)"
     ]
   },
   "sandbox": {

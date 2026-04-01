@@ -212,8 +212,10 @@ def _try_build_trt(cutie, cfg, torch_rt, device):
         weights_path=weights_path, fp16=fp16, device=device,
     )
 
-    # TRT readout disabled — ONNX export of nn.MultiheadAttention with
-    # boolean/float-inf masks produces NaN in TRT. Use torch.compile instead.
+    # TRT readout disabled: ONNX→TRT produces incorrect output despite
+    # wrapper being verified correct in PyTorch (diff<0.025). Root cause is
+    # in TRT's handling of the exported graph, not cache or precision.
+    # Encoder + mask decoder TRT already give 1.6x speedup (163→108ms).
     trt_readout = None
 
     return trt_encoder, trt_mask_decoder, trt_readout
