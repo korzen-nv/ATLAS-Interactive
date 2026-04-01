@@ -32,6 +32,7 @@ from gui.exporter import convert_frames_to_video, convert_mask_to_binary
 from gui.global_memory import GlobalMemoryStore
 
 from gui.cutie.utils.palette import custom_palette_np # added
+from gui.crf_refine import apply_crf as _apply_crf, is_available as _crf_available
 
 log = logging.getLogger()
 
@@ -112,6 +113,9 @@ class MainController():
         self.uncertainty_markers: set[int] = set()
         self._uncertainty_scores: dict[int, float] = {}
 
+        # CRF post-processing
+        self.crf_enabled = False
+
         # visualization info
         self.vis_mode: str = 'davis'
         self.vis_image: np.ndarray = None
@@ -165,10 +169,30 @@ class MainController():
         self.gui.text('Initialized.')
         self.initialized = True
 
+        # preload progress polling
+        if self.res_man.preload and not self.res_man._preload_finished:
+            from PySide6.QtCore import QTimer
+            self._preload_timer = QTimer()
+            self._preload_timer.setInterval(500)
+            self._preload_timer.timeout.connect(self._on_preload_progress)
+            self._preload_timer.start()
+            self.gui.text('Preloading frames into memory...')
+
         # try to load the default overlay
         self._try_load_layer('./docs/uiuc.png')
         self.gui.set_object_color(self.curr_object)
         self.update_config()
+
+    def _on_preload_progress(self):
+        progress = self.res_man.preload_progress()
+        self.gui.progressbar.setValue(int(progress * 100))
+        if self.res_man._preload_finished:
+            self._preload_timer.stop()
+            self.gui.progressbar.setValue(100)
+            gb = self.res_man._estimate_cache_gb()
+            self.gui.text(f'Preload complete: {self.res_man.length} frames cached ({gb:.1f} GB)')
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(3000, lambda: self.gui.progressbar.setValue(0))
 
     def initialize_networks(self) -> None:
         self._propagation, self.click_ctrl = create_backends(
@@ -627,6 +651,8 @@ class MainController():
 
                 self.curr_prob = self.processor.step(self.curr_image_torch,
                                                      frame_idx=self.curr_ti)
+                if self.crf_enabled and _crf_available():
+                    self.curr_prob = _apply_crf(self.curr_image_np, self.curr_prob)
                 self.curr_mask = torch_prob_to_numpy_mask(self.curr_prob)
                 if self.fill_gaps:
                     self.curr_mask = self.fill_mask_gaps(self.curr_mask)
@@ -694,6 +720,8 @@ class MainController():
 
                 self.curr_prob = self.processor.step(self.curr_image_torch,
                                                       frame_idx=self.curr_ti)
+                if self.crf_enabled and _crf_available():
+                    self.curr_prob = _apply_crf(self.curr_image_np, self.curr_prob)
                 self.curr_mask = torch_prob_to_numpy_mask(self.curr_prob)
                 if self.fill_gaps:
                     self.curr_mask = self.fill_mask_gaps(self.curr_mask)
@@ -741,6 +769,12 @@ class MainController():
 
     def on_play_video_timer(self):
         self.curr_ti += 1
+        if self.curr_ti > self.T - 1:
+            self.curr_ti = 0
+        self.gui.tl_slider.setValue(self.curr_ti)
+
+    def on_play_video_timer_x4(self):
+        self.curr_ti += 4
         if self.curr_ti > self.T - 1:
             self.curr_ti = 0
         self.gui.tl_slider.setValue(self.curr_ti)
@@ -1394,6 +1428,28 @@ class MainController():
         self.fill_gaps = self.gui.fill_gaps_checkbox.isChecked()
         state = 'ON' if self.fill_gaps else 'OFF'
         self.gui.text(f'Fill gaps: {state}')
+
+    def on_crf_toggle(self):
+        self.crf_enabled = self.gui.crf_checkbox.isChecked()
+        if self.crf_enabled and not _crf_available():
+            self.gui.text('CRF unavailable — install pydensecrf2')
+            self.crf_enabled = False
+            self.gui.crf_checkbox.setChecked(False)
+            return
+        state = 'ON' if self.crf_enabled else 'OFF'
+        self.gui.text(f'CRF refine: {state}')
+
+    def on_apply_crf_current_frame(self):
+        if not _crf_available():
+            self.gui.text('CRF unavailable — install pydensecrf2')
+            return
+        self._snapshot_mask()
+        self.convert_current_image_mask_torch()
+        self.curr_prob = _apply_crf(self.curr_image_np, self.curr_prob)
+        self.curr_mask = torch_prob_to_numpy_mask(self.curr_prob)
+        self.save_current_mask()
+        self.show_current_frame()
+        self.gui.text(f'CRF applied to frame {self.curr_ti}.')
 
     def fill_mask_gaps(self, mask: np.ndarray, iterations: int = 3) -> np.ndarray:
         """Dilate each labeled segment into background pixels to close thin gaps."""

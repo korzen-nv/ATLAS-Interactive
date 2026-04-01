@@ -4,8 +4,8 @@ import shutil
 import collections
 import logging
 from dataclasses import dataclass
-from queue import Queue
-from threading import Thread
+from queue import Queue, Empty
+from threading import Thread, Lock
 from omegaconf import DictConfig, open_dict
 from typing import Dict, Optional, Tuple, Literal, Union
 import cv2
@@ -24,24 +24,41 @@ log = logging.getLogger()
 # ah python ah why
 class LRU:
 
-    def __init__(self, func, maxsize=128):
+    def __init__(self, func, maxsize=128, unlimited=False):
         self.cache = collections.OrderedDict()
         self.func = func
         self.maxsize = maxsize
+        self.unlimited = unlimited
+        self.lock = Lock()
 
     def __call__(self, *args):
-        cache = self.cache
-        if args in cache:
-            cache.move_to_end(args)
-            return cache[args]
+        with self.lock:
+            cache = self.cache
+            if args in cache:
+                cache.move_to_end(args)
+                return cache[args]
+        # Release lock during I/O so preload threads don't block main thread
         result = self.func(*args)
-        cache[args] = result
-        if len(cache) > self.maxsize:
-            cache.popitem(last=False)
-        return result
+        with self.lock:
+            self.cache[args] = result
+            if not self.unlimited and len(self.cache) > self.maxsize:
+                self.cache.popitem(last=False)
+            return result
+
+    def put(self, key, value):
+        """Insert or update a value directly, bypassing the wrapped function."""
+        with self.lock:
+            self.cache[key] = value
+            if not self.unlimited and len(self.cache) > self.maxsize:
+                self.cache.popitem(last=False)
 
     def invalidate(self, key):
-        self.cache.pop(key, None)
+        with self.lock:
+            self.cache.pop(key, None)
+
+    def __len__(self):
+        with self.lock:
+            return len(self.cache)
 
 
 @dataclass
@@ -102,8 +119,18 @@ class ResourceManager:
             os.makedirs(path.join(self.soft_mask_dir, f'{i}'), exist_ok=True)
 
         # convert read functions to be buffered
-        self.get_image = LRU(self._get_image_unbuffered, maxsize=cfg['buffer_size'])
-        self.get_mask = LRU(self._get_mask_unbuffered, maxsize=cfg['buffer_size'])
+        self.preload = cfg.get('preload', False)
+        unlimited = self.preload
+        self.get_image = LRU(self._get_image_unbuffered, maxsize=cfg['buffer_size'],
+                             unlimited=unlimited)
+        self.get_mask = LRU(self._get_mask_unbuffered, maxsize=cfg['buffer_size'],
+                            unlimited=unlimited)
+
+        # preload progress tracking
+        self._preload_total = 0
+        self._preload_done = 0
+        self._preload_lock = Lock()
+        self._preload_finished = not self.preload  # already "done" if disabled
 
         # extract frames from video
         if need_decoding:
@@ -134,6 +161,79 @@ class ResourceManager:
         for t in self.save_threads:
             t.daemon = True
             t.start()
+
+        # kick off background preloading of all frames + masks
+        if self.preload:
+            self._start_preload(num_workers=cfg.get('num_read_workers', 4))
+
+    def _start_preload(self, num_workers: int = 4):
+        """Spawn background threads to load all images and masks into cache."""
+        self._preload_total = self.length * 2  # images + masks
+        self._preload_done = 0
+        self._preload_finished = False
+
+        work_queue = Queue()
+        for ti in range(self.length):
+            work_queue.put(ti)
+
+        threads = []
+        for _ in range(num_workers):
+            t = Thread(target=self._preload_worker, args=(work_queue,), daemon=True)
+            t.start()
+            threads.append(t)
+
+        def _wait_all():
+            for t in threads:
+                t.join()
+            self._preload_finished = True
+            gb = self._estimate_cache_gb()
+            log.info('Preload complete: %d images + %d masks cached (%.1f GB)',
+                     len(self.get_image), len(self.get_mask), gb)
+
+        Thread(target=_wait_all, daemon=True).start()
+
+    def _preload_worker(self, work_queue: Queue):
+        """Load images + masks from the work queue until empty."""
+        while True:
+            try:
+                ti = work_queue.get_nowait()
+            except Empty:
+                break
+
+            # Load image
+            try:
+                if (ti,) not in self.get_image.cache:
+                    img = self._get_image_unbuffered(ti)
+                    self.get_image.put((ti,), img)
+            except Exception as e:
+                log.warning('Preload image %d failed: %s', ti, e)
+
+            with self._preload_lock:
+                self._preload_done += 1
+
+            # Load mask
+            try:
+                if (ti,) not in self.get_mask.cache:
+                    mask = self._get_mask_unbuffered(ti)
+                    self.get_mask.put((ti,), mask)
+            except Exception as e:
+                log.warning('Preload mask %d failed: %s', ti, e)
+
+            with self._preload_lock:
+                self._preload_done += 1
+
+    def preload_progress(self) -> float:
+        """Return preload progress as a float in [0.0, 1.0]."""
+        if not self.preload or self._preload_total == 0:
+            return 1.0
+        with self._preload_lock:
+            return self._preload_done / self._preload_total
+
+    def _estimate_cache_gb(self) -> float:
+        """Rough estimate of memory used by image + mask caches."""
+        img_bytes = self.height * self.width * 3
+        mask_bytes = self.height * self.width
+        return (len(self.get_image) * img_bytes + len(self.get_mask) * mask_bytes) / (1024**3)
 
     def __del__(self):
         for _ in range(self.num_save_threads):
@@ -222,10 +322,15 @@ class ResourceManager:
         assert 0 <= ti < self.length
         assert isinstance(mask, np.ndarray)
 
-        mask = Image.fromarray(mask)
-        mask.putpalette(self.palette)
-        self.invalidate(ti)
-        self.add_to_queue_with_warning(SaveItem('mask', mask, self.names[ti]))
+        # Write-through: update the in-memory cache directly so scrubbing
+        # back to this frame never triggers a disk read.
+        # .copy() is essential — curr_mask is mutated in-place by brush strokes.
+        self.get_mask.put((ti,), mask.copy())
+
+        # Queue background disk write (unchanged)
+        pil_mask = Image.fromarray(mask)
+        pil_mask.putpalette(self.palette)
+        self.add_to_queue_with_warning(SaveItem('mask', pil_mask, self.names[ti]))
 
     def save_visualization(self, ti: int, vis_mode: str, image: np.ndarray):
         # image should be uint8 3*H*W

@@ -194,6 +194,8 @@ class GUI(QWidget):
         # set up some buttons
         self.play_button = QPushButton('Play video')
         self.play_button.clicked.connect(self.on_play_video)
+        self.play_x4_button = QPushButton('Play x4')
+        self.play_x4_button.clicked.connect(self.on_play_video_x4)
         self.commit_button = QPushButton('Commit to permanent memory')
         self.commit_button.clicked.connect(controller.on_commit)
 
@@ -212,6 +214,12 @@ class GUI(QWidget):
             'Dilate each segment into unassigned (background) pixels to close thin gaps between segments'
         )
         self.fill_gaps_checkbox.stateChanged.connect(controller.on_fill_gaps_toggle)
+
+        # CRF refinement toggle
+        self.crf_checkbox = QCheckBox('CRF refine')
+        self.crf_checkbox.setChecked(False)
+        self.crf_checkbox.setToolTip('Apply Dense CRF to snap mask boundaries to image edges')
+        self.crf_checkbox.stateChanged.connect(controller.on_crf_toggle)
 
         # universal progressbar
         self.progressbar = QProgressBar()
@@ -374,6 +382,7 @@ class GUI(QWidget):
         interact_topbox.setAlignment(Qt.AlignmentFlag.AlignCenter)
         interact_topbox.addWidget(self.lcd)
         interact_topbox.addWidget(self.play_button)
+        interact_topbox.addWidget(self.play_x4_button)
         interact_topbox.addWidget(self.reset_frame_button)
         interact_topbox.addWidget(self.reset_object_button)
         interact_topbox.addWidget(self.remove_object_all_button)
@@ -418,6 +427,7 @@ class GUI(QWidget):
         control_topbox.addWidget(self.forward_run_button)
         control_topbox.addWidget(self.backward_run_button)
         control_topbox.addWidget(self.fill_gaps_checkbox)
+        control_topbox.addWidget(self.crf_checkbox)
         control_botbox.addWidget(self.progressbar)
         control_subbox.addLayout(control_topbox)
         control_subbox.addLayout(control_botbox)
@@ -481,6 +491,11 @@ class GUI(QWidget):
         self.timer = QTimer()
         self.timer.setSingleShot(False)
         self.timer.timeout.connect(controller.on_play_video_timer)
+
+        # timer to play video at x4 speed
+        self.timer_x4 = QTimer()
+        self.timer_x4.setSingleShot(False)
+        self.timer_x4.timeout.connect(controller.on_play_video_timer_x4)
 
         # timer to update GPU usage
         self.gpu_timer = QTimer()
@@ -571,6 +586,9 @@ class GUI(QWidget):
         # undo last mask edit
         QShortcut(QKeySequence(Qt.Key.Key_Z | Qt.KeyboardModifier.ControlModifier),
                     self).activated.connect(controller.on_undo)
+
+        # CRF
+        QShortcut(QKeySequence(Qt.Key.Key_R), self).activated.connect(controller.on_apply_crf_current_frame)
 
         # uncertainty marker navigation
         QShortcut(QKeySequence(Qt.Key.Key_N), self).activated.connect(controller.on_next_uncertainty_marker)
@@ -735,8 +753,24 @@ class GUI(QWidget):
             self.timer.stop()
             self.play_button.setText('Play video')
         else:
+            # stop x4 if running
+            if self.timer_x4.isActive():
+                self.timer_x4.stop()
+                self.play_x4_button.setText('Play x4')
             self.timer.start(1000 // 30)
             self.play_button.setText('Stop video')
+
+    def on_play_video_x4(self):
+        if self.timer_x4.isActive():
+            self.timer_x4.stop()
+            self.play_x4_button.setText('Play x4')
+        else:
+            # stop normal play if running
+            if self.timer.isActive():
+                self.timer.stop()
+                self.play_button.setText('Play video')
+            self.timer_x4.start(1000 // 30)
+            self.play_x4_button.setText('Stop x4')
 
     def open_file(self, prompt):
         options = QFileDialog.Options()

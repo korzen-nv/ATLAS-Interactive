@@ -116,18 +116,21 @@ color_palette = {
     2: (200, 150, 100),  # Abdominal wall - Beige
     3: (0, 255, 0),      # GI Tract - Green
     4: (255, 255, 0),    # Fat - Yellow
-    5: (255, 0, 0),      # Blood - Red
-    6: (0, 200, 255),    # Gallbladder - Teal
-    7: (255, 105, 180),  # Gallbladder Resection Bed / Connective tissue / Cystic plate - Light Pink 
-    8: (255, 255, 255),  # Coagulated tissue - White
-    9: (0, 255, 255),    # Cystic duct - Cyan
-    10: (180, 0, 0),     # Cystic artery - Dark Red
-    11: (0, 0, 255),    # Monopolar hook - Blue
-    12: (0, 0, 180),    # Grasper - Dark Blue
-    13: (255, 150, 50),   # Liver ligament - Orange
-    14: (200, 0, 200),   # Other instrument - Purple
-    15: (50, 50, 50),    # Other structure - Dark Gray
-    16: (0, 0, 0),       # Background - Black
+    5: (180, 180, 0),    # Connective tissue - Yellow
+    6: (255, 0, 0),      # Blood - Red
+    7: (255, 255, 255),  # Coagulated tissue - White
+    8: (0, 200, 255),    # Gallbladder - Teal
+    9: (255, 105, 180),  # Gallbladder Resection Bed / Cystic plate - Light Pink 
+    10: (0, 255, 255),    # Cystic duct - Cyan
+    11: (180, 0, 0),     # Cystic artery - Dark Red
+    12: (0, 0, 255),    # Monopolar hook - Blue
+    13: (0, 0, 180),    # Grasper - Dark Blue
+    14: (0, 0, 100),    # Scissors - Darker Blue
+    15: (255, 150, 50),   # Liver ligament - Orange
+    16: (200, 0, 200),   # Other instrument - Purple
+    17: (50, 50, 50),    # Other structure - Dark Gray
+    18: (50, 50, 50),    # HUD Overlay - Dark Gray
+    19: (0, 0, 0),       # Background - Black
 }
 
 custom_names = {
@@ -135,18 +138,21 @@ custom_names = {
     2: "Abdominal wall",
     3: "GI Tract",
     4: "Fat",
-    5: "Blood",
-    6: "Gallbladder",
-    7: "Gallbladder Resection Bed / Connective tissue",  #damaged tissue after resection
-    8: "Coagulated tissue",  #damaged tissue after resection
-    9: "Cystic duct",
-    10: "Cystic artery",
-    11: "Monopolar hook",
-    12: "Grasper",
-    13: "Liver ligament",
-    14: "Other instrument / Clip",
-    15: "Other structure",
-    16: "Background",
+    5: "Connective tissue",
+    6: "Blood",
+    7: "Coagulated tissue",  
+    8: "Gallbladder",
+    9: "Gallbladder Resection Bed / Cystic plate",  #damaged tissue after resection
+    10: "Cystic duct",
+    11: "Cystic artery",
+    12: "Monopolar hook",
+    13: "Grasper",
+    14: "Curved scissors",
+    15: "Liver ligament",
+    16: "Other instrument / Clip",
+    17: "Other structure",
+    18: "HUD Overlay",
+    19: "Background",
 }
 
 # color_palette = {

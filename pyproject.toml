@@ -50,6 +50,7 @@ dependencies = [
   'flash-attn-3 == 3.0.0; sys_platform == "linux"',
   'ninja >= 1.13.0',
   'psutil >= 7.2.2',
+  'pydensecrf2>=1.0',
 ]
 
 [project.optional-dependencies]
@@ -57,12 +58,7 @@ desktop = [
   'PySide6 >= 6.2.0',
   'pyqtdarktheme',
 ]
-sam2 = [
 
-]
-sam3 = [
-  'sam3 @ file:///home/pkorzeniowsk/Projects/sam3/sam3',
-]
 
 [tool.uv]
 extra-index-url = ["https://download.pytorch.org/whl/cu128"]

@@ -13,7 +13,7 @@ mask_endpoint: masks
 vis_endpoint: vis
 
 # Backend selection: cutie | sam2 | sam3 | sam31
-backend: sam31
+backend: cutie
 
 amp: True
 weights: gui/weights/cutie-surgenetseg-50k.pth
@@ -38,10 +38,12 @@ sam3_model_cfg: null
 sam3_bpe_path: null
 
 # SAM 3.1 config (only used when backend: sam31)
-sam31_weights: gui/weights/sam3.1_multiplex.pt
+sam31_weights: gui/weights/sam31_fulltune_epoch_30.pt
 # LoRA fine-tune weights for surgical segmentation (set to null to disable)
-sam31_lora_weights: gui/weights/sam31_lora_cholecystectomy.pt
-#sam31_lora_weights: null
+sam31_lora_weights: null
+#sam31_lora_weights: gui/weights/sam31_lora_cholecystectomy.pt
+# Original base model (uncomment to revert):
+#sam31_weights: gui/weights/sam3.1_multiplex.pt
 
 
 # Auto-segmentation (SurgNetXL seg head) — press 'A' to auto-segment current frame
@@ -74,6 +76,7 @@ max_internal_size: 480
 # it should not be smaller than the internal size
 max_overall_size: 1080
 buffer_size: 20
+preload: true   # preload all frames+masks into RAM; disable on low-memory machines
 
 # we use multithreading for saving the results
 save_queue_size: 20
