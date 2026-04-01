@@ -81,7 +81,8 @@ class InferenceCore:
                  image_feature_store: ImageFeatureStore = None,
                  torch_rt: Optional[TorchRT] = None,
                  trt_encoder=None,
-                 trt_mask_decoder=None):
+                 trt_mask_decoder=None,
+                 trt_readout=None):
         self.network = network
         self.cfg = cfg
         self.mem_every = cfg.mem_every
@@ -110,6 +111,7 @@ class InferenceCore:
             self.image_feature_store = image_feature_store
 
         self.trt_mask_decoder = trt_mask_decoder
+        self.trt_readout = trt_readout
         self.profiler = _StepProfiler()
         self.profiler.enabled = cfg.get('profile', False)
         self.last_mask = None
@@ -216,7 +218,20 @@ class InferenceCore:
                                dtype=key.dtype)
 
         self.profiler.mark('mem_read')
-        memory_readout = self.memory.read(pix_feat, key, selection, self.last_mask, self.network)
+
+        # Build TRT readout callback if available
+        readout_fn = None
+        if (self.trt_readout is not None
+                and not self.flip_aug and key.shape[0] == 1):
+            _trt = self.trt_readout
+
+            def readout_fn(pf, vis, sens, lm, obj_mem):
+                lm_ds = F.avg_pool2d(lm, 16, 16)
+                return _trt(pf, vis, sens, lm_ds, obj_mem)
+
+        memory_readout = self.memory.read(
+            pix_feat, key, selection, self.last_mask, self.network,
+            readout_fn=readout_fn)
         memory_readout = self.object_manager.realize_dict(memory_readout)
         self.profiler.mark('mask_decode')
         current_sensory = self.memory.get_sensory(self.object_manager.all_obj_ids)
