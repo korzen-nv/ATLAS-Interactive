@@ -59,10 +59,30 @@ class SurgNetSegBackend:
         checkpoint: str,
         device: str = "cuda",
         class_map: Optional[Dict[int, int]] = None,
+        *,
+        torch_compile: bool = False,
+        torch_compile_mode: str = "max-autotune-no-cudagraphs",
+        fp8: bool = False,
     ) -> None:
         self._device = device
         self._class_map = class_map or DEFAULT_CLASS_MAP
         self._model = self._load_model(checkpoint, device)
+
+        # GPU optimisation ---------------------------------------------------
+        if fp8:
+            try:
+                from torchao.quantization import quantize_, Float8WeightOnlyConfig
+                log.info("SurgNetSeg: applying FP8 weight-only quantization")
+                quantize_(self._model, Float8WeightOnlyConfig())
+            except ImportError:
+                log.warning("fp8: torchao not installed — skipping.  "
+                            "Install with: pip install torchao")
+        if torch_compile:
+            log.info("SurgNetSeg: torch.compile (mode=%s)", torch_compile_mode)
+            self._model = torch.compile(
+                self._model, mode=torch_compile_mode, dynamic=True)
+        # --------------------------------------------------------------------
+
         log.info(
             "SurgNetSeg loaded (%.1fM params) on %s",
             sum(p.numel() for p in self._model.parameters()) / 1e6,

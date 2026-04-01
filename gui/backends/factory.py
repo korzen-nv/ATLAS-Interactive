@@ -5,11 +5,71 @@ import logging
 from typing import Optional, Tuple
 
 import torch
+import torch.nn as nn
 from omegaconf import DictConfig
 
 from gui.backends.base import ClickBackend, PropagationBackend
 
 log = logging.getLogger(__name__)
+
+
+def _apply_torch_compile(model: nn.Module, cfg: DictConfig,
+                         submodules: Optional[list] = None) -> nn.Module:
+    """Apply torch.compile to a model or its submodules.
+
+    Args:
+        model: The model to compile.
+        cfg: Config with ``torch_compile`` and ``torch_compile_mode`` keys.
+        submodules: If given, compile only these named submodules instead of
+            the whole model.  Each name must be a direct attribute.
+
+    Returns:
+        The (possibly modified) model.
+    """
+    if not cfg.get('torch_compile', False):
+        return model
+    mode = cfg.get('torch_compile_mode', 'max-autotune-no-cudagraphs')
+    if submodules:
+        for name in submodules:
+            sub = getattr(model, name, None)
+            if sub is not None:
+                log.info("torch.compile: compiling %s.%s (mode=%s)",
+                         type(model).__name__, name, mode)
+                setattr(model, name,
+                        torch.compile(sub, mode=mode, dynamic=True))
+    else:
+        log.info("torch.compile: compiling %s (mode=%s)",
+                 type(model).__name__, mode)
+        model = torch.compile(model, mode=mode, dynamic=True)
+    return model
+
+
+def _apply_fp8(model: nn.Module, cfg: DictConfig) -> nn.Module:
+    """Apply FP8 weight-only quantization via torchao.
+
+    Replaces weight storage with FP8 (E4M3) + per-tensor scale.  Compute
+    remains in FP16/FP32 (respects existing autocast).  Memory bandwidth for
+    weight loads is halved.
+
+    Args:
+        model: The model to quantize.
+        cfg: Config with ``fp8`` key.
+
+    Returns:
+        The (possibly modified) model.
+    """
+    if not cfg.get('fp8', False):
+        return model
+    try:
+        from torchao.quantization import quantize_, Float8WeightOnlyConfig
+    except ImportError:
+        log.warning("fp8: torchao not installed — skipping FP8 quantization.  "
+                     "Install with: pip install torchao")
+        return model
+    log.info("fp8: applying FP8 weight-only quantization to %s",
+             type(model).__name__)
+    quantize_(model, Float8WeightOnlyConfig())
+    return model
 
 
 def create_auto_segmenter(cfg: DictConfig, device: str):
@@ -29,7 +89,14 @@ def create_auto_segmenter(cfg: DictConfig, device: str):
     if raw_map:
         class_map = {int(k): int(v) for k, v in raw_map.items()}
 
-    return SurgNetSegBackend(checkpoint=weights, device=device, class_map=class_map)
+    return SurgNetSegBackend(
+        checkpoint=weights,
+        device=device,
+        class_map=class_map,
+        torch_compile=cfg.get('torch_compile', False),
+        torch_compile_mode=cfg.get('torch_compile_mode', 'max-autotune-no-cudagraphs'),
+        fp8=cfg.get('fp8', False),
+    )
 
 
 def create_backends(
@@ -83,6 +150,15 @@ def _create_cutie(cfg, device, shared_model):
         cutie = CUTIE(cfg).eval().to(device)
         weights = torch.load(cfg.weights, map_location=device)
         cutie.load_weights(weights)
+
+        # GPU optimisation: FP8 weight quantize, then torch.compile
+        # Only compile encoder + key projection — mask_encoder/mask_decoder
+        # use group ops with F.interpolate (adaptive_avg_pool2d) that the
+        # inductor cannot lower with dynamic spatial dimensions.
+        cutie = _apply_fp8(cutie, cfg)
+        _apply_torch_compile(cutie, cfg, submodules=[
+            'pixel_encoder', 'key_proj',
+        ])
 
     propagation = CutieBackend(cutie, cfg)
     click = RitmClickBackend(cfg.ritm_weights, device=device)
