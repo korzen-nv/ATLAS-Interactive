@@ -41,6 +41,14 @@ def is_available() -> bool:
     return _TRT_AVAILABLE
 
 
+def _model_signature(model: nn.Module) -> str:
+    signature_parts = [model.__class__.__name__]
+    for name, tensor in model.state_dict().items():
+        signature_parts.append(f"{name}:{tuple(tensor.shape)}:{tensor.dtype}")
+    payload = "|".join(signature_parts)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
 # ---------------------------------------------------------------------------
 # ONNX export wrapper
 # ---------------------------------------------------------------------------
@@ -214,7 +222,11 @@ class TRTEncoder:
         w_mtime = ""
         if weights_path and os.path.exists(weights_path):
             w_mtime = str(int(os.path.getmtime(weights_path)))
-        key_str = f"enc_{h}x{w}_fp{int(fp16)}_{gpu_name}_trt{trt.__version__}_{w_mtime}"
+        model_sig = _model_signature(cutie)
+        key_str = (
+            f"enc_{h}x{w}_fp{int(fp16)}_{gpu_name}_trt{trt.__version__}"
+            f"_{model_sig}_{w_mtime}"
+        )
         key_hash = hashlib.sha256(key_str.encode()).hexdigest()[:16]
 
         if cache_dir is None:
@@ -576,9 +588,10 @@ class TRTMaskDecoder:
         w_mtime = ""
         if weights_path and os.path.exists(weights_path):
             w_mtime = str(int(os.path.getmtime(weights_path)))
+        model_sig = _model_signature(cutie)
         key_str = (
             f"maskdec_{h}x{w}_no{NO}_fp{int(fp16)}"
-            f"_{gpu_name}_trt{trt.__version__}_{w_mtime}"
+            f"_{gpu_name}_trt{trt.__version__}_{model_sig}_{w_mtime}"
         )
         key_hash = hashlib.sha256(key_str.encode()).hexdigest()[:16]
 
@@ -603,11 +616,15 @@ class TRTMaskDecoder:
 
         try:
             wrapper = _MaskDecoderONNXWrapper(cutie, NO).eval().to(device)
+            f8_channels = cutie.ms_dims[1]
+            f4_channels = cutie.ms_dims[2]
+            memory_channels = cutie.embed_dim
+            sensory_channels = cutie.sensory_dim
             dummy = (
-                torch.randn(1, 512, h8, w8, device=device),
-                torch.randn(1, 256, h4, w4, device=device),
-                torch.randn(1, NO, 256, h16, w16, device=device),
-                torch.randn(1, NO, 256, h16, w16, device=device),
+                torch.randn(1, f8_channels, h8, w8, device=device),
+                torch.randn(1, f4_channels, h4, w4, device=device),
+                torch.randn(1, NO, memory_channels, h16, w16, device=device),
+                torch.randn(1, NO, sensory_channels, h16, w16, device=device),
             )
             engine_bytes = _onnx_to_trt(
                 wrapper,
@@ -684,8 +701,14 @@ def _manual_mha(
     scores = torch.matmul(Q, K.transpose(-2, -1)) * scale  # (B, NH, q_len, kv_len)
 
     if attn_mask is not None:
-        # attn_mask: (B*NH, q_len, kv_len) → (B, NH, q_len, kv_len)
-        scores = scores + attn_mask.view(B, NH, scores.shape[2], scores.shape[3])
+        if attn_mask.dim() == 4:
+            if attn_mask.shape[1] == 1:
+                attn_mask = attn_mask.expand(-1, NH, -1, -1)
+            elif attn_mask.shape[1] != NH:
+                raise ValueError(f"Unsupported attention mask shape {tuple(attn_mask.shape)}")
+        else:
+            attn_mask = attn_mask.view(B, NH, scores.shape[2], scores.shape[3])
+        scores = scores + attn_mask
 
     attn = torch.softmax(scores, dim=-1)
     out = torch.matmul(attn, V)  # (B, NH, q_len, HD)
@@ -872,14 +895,13 @@ class _ReadoutPipelineONNXWrapper(nn.Module):
         inv_fg = ~fg_flat
         inv_bg = fg_flat
 
-        NH = self.num_heads
         NQ2 = self.num_queries // 2
+        bg_queries = self.num_queries - NQ2
         HW = H * W
 
-        m_fg = inv_fg.unsqueeze(2).unsqueeze(2).expand(-1, -1, NH, NQ2, HW)
-        m_bg = inv_bg.unsqueeze(2).unsqueeze(2).expand(-1, -1, NH, NQ2, HW)
-        aux = torch.cat([m_fg, m_bg], dim=3)
-        aux = aux.reshape(-1, self.num_queries, HW)
+        m_fg = inv_fg.unsqueeze(2).expand(-1, -1, NQ2, HW)
+        m_bg = inv_bg.unsqueeze(2).expand(-1, -1, bg_queries, HW)
+        aux = torch.cat([m_fg, m_bg], dim=2)
 
         # Un-block fully-masked queries
         all_blocked = aux.sum(-1, keepdim=True) == HW
@@ -890,7 +912,7 @@ class _ReadoutPipelineONNXWrapper(nn.Module):
             aux.shape, dtype=torch.float32, device=aux.device
         )
         float_mask.masked_fill_(aux, float("-inf"))
-        return float_mask
+        return float_mask.unsqueeze(1)
 
 
 class TRTReadout:
@@ -998,9 +1020,10 @@ class TRTReadout:
         w_mtime = ""
         if weights_path and os.path.exists(weights_path):
             w_mtime = str(int(os.path.getmtime(weights_path)))
+        model_sig = _model_signature(cutie)
         key_str = (
             f"readout_{h}x{w}_no{NO}_fp{int(fp16)}"
-            f"_{gpu_name}_trt{trt.__version__}_{w_mtime}"
+            f"_{gpu_name}_trt{trt.__version__}_{model_sig}_{w_mtime}"
         )
         key_hash = hashlib.sha256(key_str.encode()).hexdigest()[:16]
 
@@ -1027,12 +1050,20 @@ class TRTReadout:
             wrapper = _ReadoutPipelineONNXWrapper(
                 cutie, NO, h16, w16,
             ).eval().to(device)
+            pix_channels = cutie.pixel_dim
+            visual_channels = cutie.value_dim
+            sensory_channels = cutie.sensory_dim
             dummy = (
-                torch.randn(1, 256, h16, w16, device=device),         # pix_feat
-                torch.randn(1, NO, 256, h16, w16, device=device),     # visual_readout
-                torch.randn(1, NO, 256, h16, w16, device=device),     # sensory
+                torch.randn(1, pix_channels, h16, w16, device=device),        # pix_feat
+                torch.randn(1, NO, visual_channels, h16, w16, device=device), # visual_readout
+                torch.randn(1, NO, sensory_channels, h16, w16, device=device), # sensory
                 torch.randn(1, NO, h16, w16, device=device),          # last_mask_ds
-                torch.randn(1, NO, 1, 16, 257, device=device),        # obj_summaries
+                torch.randn(1,
+                            NO,
+                            1,
+                            wrapper.num_queries,
+                            wrapper.embed_dim + 1,
+                            device=device),                            # obj_summaries
             )
             engine_bytes = _onnx_to_trt(
                 wrapper, dummy,

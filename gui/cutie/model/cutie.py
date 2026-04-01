@@ -161,13 +161,15 @@ class CUTIE(nn.Module):
                       obj_memory,
                       *,
                       selector=None,
-                      need_weights=False) -> (torch.Tensor, Dict[str, torch.Tensor]):
+                      need_weights=False,
+                      profiler=None) -> (torch.Tensor, Dict[str, torch.Tensor]):
         if not self.object_transformer_enabled:
             return pixel_readout, None
         return self.object_transformer(pixel_readout,
                                        obj_memory,
                                        selector=selector,
-                                       need_weights=need_weights)
+                                       need_weights=need_weights,
+                                       profiler=profiler)
 
     def segment(self,
                 ms_image_feat: List[torch.Tensor],

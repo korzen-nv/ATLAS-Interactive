@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from typing import Dict, Optional
 from omegaconf import DictConfig
 
@@ -44,7 +45,7 @@ class QueryTransformerBlock(nn.Module):
         # pixel: bs*num_objects*C*H*W
         # query_pe: (bs*num_objects)*num_queries*embed_dim
         # pixel_pe: (bs*num_objects)*(H*W)*C
-        # attn_mask: (bs*num_objects*num_heads)*num_queries*(H*W)
+        # attn_mask: (bs*num_objects)*1*num_queries*(H*W)
 
         # bs*num_objects*C*H*W -> (bs*num_objects)*(H*W)*C
         pixel_flat = pixel.flatten(3, 4).flatten(0, 1).transpose(1, 2).contiguous()
@@ -115,7 +116,8 @@ class QueryTransformer(nn.Module):
                 pixel: torch.Tensor,
                 obj_summaries: torch.Tensor,
                 selector: Optional[torch.Tensor] = None,
-                need_weights: bool = False) -> (torch.Tensor, Dict[str, torch.Tensor]):
+                need_weights: bool = False,
+                profiler=None) -> (torch.Tensor, Dict[str, torch.Tensor]):
         # pixel: B*num_objects*embed_dim*H*W
         # obj_summaries: B*num_objects*T*num_queries*embed_dim
         T = obj_summaries.shape[2]
@@ -148,39 +150,43 @@ class QueryTransformer(nn.Module):
 
         # run the transformer
         aux_features = {'logits': []}
+        section = profiler.section if profiler is not None else nullcontext
 
         # first aux output
         aux_logits = self.mask_pred[0](pixel).squeeze(2)
-        attn_mask = self._get_aux_mask(aux_logits, selector)
+        with section('aux_mask'):
+            attn_mask = self._get_aux_mask(aux_logits, selector)
         aux_features['logits'].append(aux_logits)
         for i in range(self.num_blocks):
-            query, pixel, q_weights, p_weights = self.blocks[i](query,
-                                                                pixel,
-                                                                query_emb,
-                                                                pixel_pe,
-                                                                attn_mask,
-                                                                need_weights=need_weights)
+            with section('object_transformer'):
+                query, pixel, q_weights, p_weights = self.blocks[i](query,
+                                                                    pixel,
+                                                                    query_emb,
+                                                                    pixel_pe,
+                                                                    attn_mask,
+                                                                    need_weights=need_weights)
 
             if self.training or i <= self.num_blocks - 1 or need_weights:
                 aux_logits = self.mask_pred[i + 1](pixel).squeeze(2)
-                attn_mask = self._get_aux_mask(aux_logits, selector)
+                with section('aux_mask'):
+                    attn_mask = self._get_aux_mask(aux_logits, selector)
                 aux_features['logits'].append(aux_logits)
 
         aux_features['q_weights'] = q_weights  # last layer only
         aux_features['p_weights'] = p_weights  # last layer only
 
         if self.training:
-            # no need to save all heads
-            aux_features['attn_mask'] = attn_mask.view(bs, num_objects, self.num_heads,
-                                                       self.num_queries, H, W)[:, :, 0]
+            aux_features['attn_mask'] = torch.isneginf(attn_mask[:, 0]).view(
+                bs, num_objects, self.num_queries, H, W)
 
         return pixel, aux_features
 
     def _get_aux_mask(self, logits: torch.Tensor, selector: torch.Tensor) -> torch.Tensor:
         # logits: batch_size*num_objects*H*W
         # selector: batch_size*num_objects*1*1
-        # returns a mask of shape (batch_size*num_objects*num_heads)*num_queries*(H*W)
-        # where True means the attention is blocked
+        # returns an additive float mask of shape
+        # (batch_size*num_objects)*1*num_queries*(H*W)
+        # where -inf means the attention is blocked
 
         if selector is None:
             prob = logits.sigmoid()
@@ -190,16 +196,18 @@ class QueryTransformer(nn.Module):
 
         is_foreground = (logits[:, 1:] >= logits.max(dim=1, keepdim=True)[0])
         foreground_mask = is_foreground.bool().flatten(start_dim=2)
-        inv_foreground_mask = ~foreground_mask
-        inv_background_mask = foreground_mask
+        half_queries = self.num_queries // 2
+        remaining_queries = self.num_queries - half_queries
 
-        aux_foreground_mask = inv_foreground_mask.unsqueeze(2).unsqueeze(2).repeat(
-            1, 1, self.num_heads, self.num_queries // 2, 1).flatten(start_dim=0, end_dim=2)
-        aux_background_mask = inv_background_mask.unsqueeze(2).unsqueeze(2).repeat(
-            1, 1, self.num_heads, self.num_queries // 2, 1).flatten(start_dim=0, end_dim=2)
+        aux_foreground_mask = (~foreground_mask).unsqueeze(2).expand(-1, -1, half_queries, -1)
+        aux_background_mask = foreground_mask.unsqueeze(2).expand(-1, -1, remaining_queries, -1)
+        aux_mask = torch.cat([aux_foreground_mask, aux_background_mask], dim=2)
 
-        aux_mask = torch.cat([aux_foreground_mask, aux_background_mask], dim=1)
+        fully_masked = aux_mask.sum(-1, keepdim=True) == aux_mask.shape[-1]
+        aux_mask = aux_mask & ~fully_masked
 
-        aux_mask[torch.where(aux_mask.sum(-1) == aux_mask.shape[-1])] = False
-
-        return aux_mask
+        float_mask = torch.zeros(aux_mask.shape,
+                                 device=aux_mask.device,
+                                 dtype=logits.dtype)
+        float_mask.masked_fill_(aux_mask, float('-inf'))
+        return float_mask.flatten(0, 1).unsqueeze(1)

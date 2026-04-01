@@ -1,4 +1,5 @@
 import logging
+from contextlib import nullcontext
 from omegaconf import DictConfig
 from typing import List, Dict
 import torch
@@ -20,6 +21,7 @@ class MemoryManager:
         self.sensory_dim = cfg.model.sensory_dim
         self.top_k = cfg.top_k
         self.chunk_size = cfg.chunk_size
+        self.readout_backend = cfg.get('readout_backend', 'auto')
 
         self.save_aux = cfg.save_aux
 
@@ -59,6 +61,7 @@ class MemoryManager:
     def update_config(self, cfg: DictConfig) -> None:
         self.config_stale = True
         self.top_k = cfg['top_k']
+        self.readout_backend = cfg.get('readout_backend', 'auto')
 
         assert self.use_long_term == cfg.use_long_term, 'cannot update this'
         assert self.count_long_term_usage == cfg.long_term.count_usage, 'cannot update this'
@@ -111,7 +114,8 @@ class MemoryManager:
 
     def read(self, pix_feat: torch.Tensor, query_key: torch.Tensor, selection: torch.Tensor,
              last_mask: torch.Tensor, network: CUTIE,
-             readout_fn=None) -> Dict[int, torch.Tensor]:
+             readout_fn=None,
+             profiler=None) -> Dict[int, torch.Tensor]:
         """
         Read from all memory stores and returns a single memory readout tensor for each object
 
@@ -134,42 +138,61 @@ class MemoryManager:
         """
         all_readout_mem = {}
         buckets = self.work_mem.buckets
+        section = profiler.section if profiler is not None else nullcontext
         for bucket_id, bucket in buckets.items():
-            if self.use_long_term and self.long_mem.engaged(bucket_id):
-                # Use long-term memory
-                long_mem_size = self.long_mem.size(bucket_id)
-                memory_key = torch.cat([self.long_mem.key[bucket_id], self.work_mem.key[bucket_id]],
-                                       -1)
-                shrinkage = torch.cat(
-                    [self.long_mem.shrinkage[bucket_id], self.work_mem.shrinkage[bucket_id]], -1)
+            with section('affinity_topk'):
+                if self.use_long_term and self.long_mem.engaged(bucket_id):
+                    # Use long-term memory
+                    long_mem_size = self.long_mem.size(bucket_id)
+                    memory_key = torch.cat([self.long_mem.key[bucket_id], self.work_mem.key[bucket_id]],
+                                           -1)
+                    shrinkage = torch.cat(
+                        [self.long_mem.shrinkage[bucket_id], self.work_mem.shrinkage[bucket_id]], -1)
 
-                similarity = get_similarity(memory_key, shrinkage, query_key, selection)
-                topk_weights, topk_indices, usage = do_softmax_sparse(
-                    similarity, top_k=self.top_k, return_usage=True)
-                """
-                Record memory usage for working and long-term memory
-                """
-                # ignore the index return for long-term memory
-                work_usage = usage[:, long_mem_size:]
-                self.work_mem.update_bucket_usage(bucket_id, work_usage)
+                    topk_weights, topk_indices, usage = sparse_topk_affinity(
+                        memory_key,
+                        shrinkage,
+                        query_key,
+                        selection,
+                        top_k=self.top_k,
+                        return_usage=True,
+                        backend=self.readout_backend,
+                    )
+                    """
+                    Record memory usage for working and long-term memory
+                    """
+                    # ignore the index return for long-term memory
+                    work_usage = usage[:, long_mem_size:]
+                    self.work_mem.update_bucket_usage(bucket_id, work_usage)
 
-                if self.count_long_term_usage:
-                    # ignore the index return for working memory
-                    long_usage = usage[:, :long_mem_size]
-                    self.long_mem.update_bucket_usage(bucket_id, long_usage)
-            else:
-                # no long-term memory
-                memory_key = self.work_mem.key[bucket_id]
-                shrinkage = self.work_mem.shrinkage[bucket_id]
-                similarity = get_similarity(memory_key, shrinkage, query_key, selection)
-
-                if self.use_long_term:
-                    topk_weights, topk_indices, usage = do_softmax_sparse(
-                        similarity, top_k=self.top_k, return_usage=True)
-                    self.work_mem.update_bucket_usage(bucket_id, usage)
+                    if self.count_long_term_usage:
+                        # ignore the index return for working memory
+                        long_usage = usage[:, :long_mem_size]
+                        self.long_mem.update_bucket_usage(bucket_id, long_usage)
                 else:
-                    topk_weights, topk_indices = do_softmax_sparse(
-                        similarity, top_k=self.top_k)
+                    # no long-term memory
+                    memory_key = self.work_mem.key[bucket_id]
+                    shrinkage = self.work_mem.shrinkage[bucket_id]
+                    if self.use_long_term:
+                        topk_weights, topk_indices, usage = sparse_topk_affinity(
+                            memory_key,
+                            shrinkage,
+                            query_key,
+                            selection,
+                            top_k=self.top_k,
+                            return_usage=True,
+                            backend=self.readout_backend,
+                        )
+                        self.work_mem.update_bucket_usage(bucket_id, usage)
+                    else:
+                        topk_weights, topk_indices = sparse_topk_affinity(
+                            memory_key,
+                            shrinkage,
+                            query_key,
+                            selection,
+                            top_k=self.top_k,
+                            backend=self.readout_backend,
+                        )
 
             if self.chunk_size < 1:
                 object_chunks = [bucket]
@@ -182,9 +205,10 @@ class MemoryManager:
                 this_sensory = self._get_sensory_by_ids(objects)
                 this_last_mask = self._get_mask_by_ids(last_mask, objects)
                 this_msk_value = self._get_visual_values_by_ids(objects)  # (1/2)*num_objects*C*N
-                visual_readout = sparse_readout(
-                    this_msk_value, topk_indices, topk_weights,
-                ).view(bs, len(objects), self.CV, h, w)
+                with section('sparse_readout'):
+                    visual_readout = sparse_readout(
+                        this_msk_value, topk_indices, topk_weights,
+                    ).view(bs, len(objects), self.CV, h, w)
 
                 this_obj_mem = self._get_object_mem_by_ids(objects)
                 this_obj_mem = this_obj_mem.unsqueeze(2) if this_obj_mem is not None else None
@@ -192,16 +216,19 @@ class MemoryManager:
                 if readout_fn is not None:
                     # TRT path: caller-provided function replaces
                     # pixel_fusion + readout_query
-                    readout_memory = readout_fn(
-                        pix_feat, visual_readout, this_sensory,
-                        this_last_mask, this_obj_mem,
-                    )
+                    pixel_readout = None
+                    with section('pixel_fusion'):
+                        readout_memory = readout_fn(
+                            pix_feat, visual_readout, this_sensory,
+                            this_last_mask, this_obj_mem,
+                        )
                     aux_features = None
                 else:
-                    pixel_readout = network.pixel_fusion(
-                        pix_feat, visual_readout, this_sensory, this_last_mask)
+                    with section('pixel_fusion'):
+                        pixel_readout = network.pixel_fusion(
+                            pix_feat, visual_readout, this_sensory, this_last_mask)
                     readout_memory, aux_features = network.readout_query(
-                        pixel_readout, this_obj_mem)
+                        pixel_readout, this_obj_mem, profiler=profiler)
 
                 for i, obj in enumerate(objects):
                     all_readout_mem[obj] = readout_memory[:, i]
