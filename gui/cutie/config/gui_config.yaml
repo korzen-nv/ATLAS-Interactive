@@ -21,6 +21,7 @@ amp: True
 torch_compile: false         # torch.compile on model submodules (warmup is slow, then faster)
 torch_compile_mode: "max-autotune-no-cudagraphs"  # compile mode: default | reduce-overhead | max-autotune-no-cudagraphs
 fp8: false                   # FP8 weight quantization (requires: pip install torchao)
+readout_backend: auto        # auto | pytorch | triton (triton falls back cleanly when unavailable)
 
 weights: gui/weights/cutie-surgenetseg-50k.pth
 ritm_weights: gui/weights/ritm-surgenetseg-50k.pth

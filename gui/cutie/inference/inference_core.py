@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import List, Optional, Iterable, Dict, TYPE_CHECKING
 import logging
 from omegaconf import DictConfig
@@ -32,6 +33,7 @@ class _StepProfiler:
         self.print_every = print_every
         self._events: list = []
         self._labels: list = []
+        self._sections: list = []
         self._count = 0
         self._accum: Dict[str, float] = {}
 
@@ -43,15 +45,33 @@ class _StepProfiler:
         self._events.append(ev)
         self._labels.append(label)
 
+    @contextmanager
+    def section(self, label: str):
+        if not self.enabled:
+            yield
+            return
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        try:
+            yield
+        finally:
+            end.record()
+            self._sections.append((label, start, end))
+
     def finish_frame(self) -> None:
         if not self.enabled or len(self._events) < 2:
             self._events.clear()
             self._labels.clear()
+            self._sections.clear()
             return
         torch.cuda.synchronize()
         for i in range(len(self._events) - 1):
             name = f"{self._labels[i]} → {self._labels[i+1]}"
             ms = self._events[i].elapsed_time(self._events[i + 1])
+            self._accum[name] = self._accum.get(name, 0.0) + ms
+        for name, start, end in self._sections:
+            ms = start.elapsed_time(end)
             self._accum[name] = self._accum.get(name, 0.0) + ms
         total_name = f"TOTAL ({self._labels[0]} → {self._labels[-1]})"
         total_ms = self._events[0].elapsed_time(self._events[-1])
@@ -61,6 +81,7 @@ class _StepProfiler:
             self._print()
         self._events.clear()
         self._labels.clear()
+        self._sections.clear()
 
     def _print(self) -> None:
         n = self._count
@@ -231,7 +252,8 @@ class InferenceCore:
 
         memory_readout = self.memory.read(
             pix_feat, key, selection, self.last_mask, self.network,
-            readout_fn=readout_fn)
+            readout_fn=readout_fn,
+            profiler=self.profiler)
         memory_readout = self.object_manager.realize_dict(memory_readout)
         self.profiler.mark('mask_decode')
         current_sensory = self.memory.get_sensory(self.object_manager.all_obj_ids)
