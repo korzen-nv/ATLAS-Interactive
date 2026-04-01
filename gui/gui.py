@@ -204,6 +204,19 @@ class GUI(QWidget):
         self.forward_run_button.clicked.connect(controller.on_forward_propagation)
         self.forward_run_button.setMinimumWidth(150)
 
+        # Display skip slider (frames to skip between displayed frames during propagation)
+        self.display_skip_label = QLabel('Disp skip: 0')
+        self.display_skip_label.setMinimumWidth(90)
+        self.display_skip_slider = QSlider(Qt.Orientation.Horizontal)
+        self.display_skip_slider.setMinimum(0)
+        self.display_skip_slider.setMaximum(128)
+        self.display_skip_slider.setValue(16)
+        self.display_skip_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.display_skip_slider.setTickInterval(16)
+        self.display_skip_slider.setMaximumWidth(200)
+        self.display_skip_slider.valueChanged.connect(self._on_display_skip_changed)
+        self._on_display_skip_changed(16)
+
         self.backward_run_button = QPushButton('Propagate backward')
         self.backward_run_button.clicked.connect(controller.on_backward_propagation)
         self.backward_run_button.setMinimumWidth(150)
@@ -319,15 +332,17 @@ class GUI(QWidget):
 
         # Main canvas — try GL widget, fall back to QLabel
         self._gl_canvas_active = False
-        try:
-            from gui.gl_canvas import GLCanvasWidget
-            from gui.interactive_utils import color_map_np
-            self.main_canvas = GLCanvasWidget(
-                self.h, self.w, controller.num_objects, color_map_np, parent=self)
-            self._gl_canvas_active = True
-            print("Using OpenGL canvas (CUDA-GL interop enabled)")
-        except Exception as e:
-            print(f"GL canvas unavailable ({e}), falling back to QLabel")
+        if cfg.get('use_gl_canvas', True):
+            try:
+                from gui.gl_canvas import GLCanvasWidget
+                from gui.interactive_utils import color_map_np
+                self.main_canvas = GLCanvasWidget(
+                    self.h, self.w, controller.num_objects, color_map_np, parent=self)
+                self._gl_canvas_active = True
+                print("Using OpenGL canvas (CUDA-GL interop enabled)")
+            except Exception as e:
+                print(f"GL canvas unavailable ({e}), falling back to QLabel")
+        if not self._gl_canvas_active:
             self.main_canvas = QLabel()
             self.main_canvas.setSizePolicy(
                 QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -470,6 +485,8 @@ class GUI(QWidget):
         control_topbox.addWidget(self.commit_button)
         control_topbox.addWidget(self.forward_run_button)
         control_topbox.addWidget(self.backward_run_button)
+        control_topbox.addWidget(self.display_skip_label)
+        control_topbox.addWidget(self.display_skip_slider)
         control_topbox.addWidget(self.fill_gaps_checkbox)
         control_topbox.addWidget(self.crf_checkbox)
         control_topbox.addWidget(self.save_soft_mask_checkbox)
@@ -839,6 +856,9 @@ class GUI(QWidget):
     def on_mouse_release(self, event):
         event.accept()
         self.on_mouse_release_fn()
+
+    def _on_display_skip_changed(self, value):
+        self.display_skip_label.setText(f'Disp skip: {value}')
 
     def on_play_video(self):
         if self.timer.isActive():

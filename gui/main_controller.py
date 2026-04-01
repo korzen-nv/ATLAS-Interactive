@@ -742,40 +742,100 @@ class MainController():
             dataset = PropagationReader(self.res_man, self.curr_ti, self.propagate_direction)
             loader = get_data_loader(dataset, self.cfg.num_read_workers)
 
-            # uncertainty tracking
-            prev_mask_unc = self.curr_mask.copy()
-            unc_scores: dict[int, float] = {}
+            # uncertainty: batched after propagation
+            _prop_tis = []
 
-            # propagate till the end
-            for data in loader:
-                if not self.propagating:
-                    break
-                self.curr_image_np, self.curr_image_torch = data
-                self.curr_image_torch = self.curr_image_torch.to(self.device, non_blocking=True)
-                self.propagate_fn()
+            # Double-buffered propagation: process frame N-1 results while
+            # GPU runs inference on frame N, maximizing GPU utilization.
+            import time
+            _THROTTLE_N = max(1, self.gui.display_skip_slider.value())
+            _prop_t0 = time.perf_counter()
+            _prop_frames = 0
 
-                self.curr_prob = self.processor.step(self.curr_image_torch,
-                                                     frame_idx=self.curr_ti)
-                if self.crf_enabled and _crf_available():
-                    self.curr_prob = _apply_crf(self.curr_image_np, self.curr_prob)
+            # Pending results from previous iteration (to process while GPU is busy)
+            _pending_prob = None
+            _pending_ti = None
+            _pending_image_np = None
+            _pending_image_torch = None
+
+            def _process_pending():
+                """Process the previous frame's results (runs while GPU computes next frame)."""
+                nonlocal _prop_frames
+                self.curr_ti = _pending_ti
+                self.curr_image_np = _pending_image_np
+                self.curr_image_torch = _pending_image_torch
+                self.curr_prob = _pending_prob
+
                 self.curr_mask = self._prob_to_mask(self.curr_prob)
                 if self.fill_gaps:
                     self.curr_mask = self.fill_mask_gaps(self.curr_mask)
 
-                # compute uncertainty: 1 - IoU vs previous frame
-                iou = self._compute_mask_iou(prev_mask_unc, self.curr_mask)
-                unc_scores[self.curr_ti] = 1.0 - iou
-                prev_mask_unc = self.curr_mask.copy()
-
                 self.save_current_mask()
-                self.show_current_frame(fast=True)
+                _prop_tis.append(self.curr_ti)
+                _prop_frames += 1
 
-                self.update_memory_gauges()
-                self.gui.process_events()
+                if _prop_frames % _THROTTLE_N == 0:
+                    self.show_current_frame(fast=True)
+                    self.update_memory_gauges()
+                    self.gui.process_events()
+                else:
+                    self.gui.update_slider(self.curr_ti)
 
-                if self.curr_ti == 0 or self.curr_ti == self.T - 1:
+            for data in loader:
+                if not self.propagating:
                     break
 
+                curr_image_np, curr_image_torch = data
+                curr_image_torch = curr_image_torch.to(self.device, non_blocking=True)
+                self.propagate_fn()
+                curr_ti = self.curr_ti
+
+                # Launch inference (GPU works asynchronously)
+                self.curr_image_torch = curr_image_torch
+                curr_prob = self.processor.step(curr_image_torch,
+                                                frame_idx=curr_ti)
+                if self.crf_enabled and _crf_available():
+                    curr_prob = _apply_crf(curr_image_np, curr_prob)
+
+                # While GPU may still be finishing, process PREVIOUS frame's results
+                if _pending_prob is not None:
+                    _saved_ti = self.curr_ti
+                    _process_pending()
+                    self.curr_ti = _saved_ti  # restore so propagate_fn advances correctly
+
+                # Stash current frame's results for next iteration
+                _pending_prob = curr_prob
+                _pending_ti = curr_ti
+                _pending_image_np = curr_image_np
+                _pending_image_torch = curr_image_torch
+
+                if curr_ti == 0 or curr_ti == self.T - 1:
+                    break
+
+            # Process the last pending frame
+            if _pending_prob is not None:
+                _process_pending()
+
+            _total = time.perf_counter() - _prop_t0
+            _avg_fps = _prop_frames / _total if _total > 0 else 0
+            _avg_ms = 1000 * _total / _prop_frames if _prop_frames > 0 else 0
+            self.gui.text(
+                f'Propagated {_prop_frames} frames in {_total:.1f}s '
+                f'({_avg_fps:.1f} fps, {_avg_ms:.1f} ms/frame)')
+
+            # Batch uncertainty computation from cached masks
+            unc_scores: dict[int, float] = {}
+            if len(_prop_tis) >= 2:
+                prev_mask = self.res_man.get_mask(_prop_tis[0])
+                if prev_mask is None:
+                    prev_mask = np.zeros((self.h, self.w), dtype=np.uint8)
+                for ti in _prop_tis[1:]:
+                    curr = self.res_man.get_mask(ti)
+                    if curr is None:
+                        curr = np.zeros((self.h, self.w), dtype=np.uint8)
+                    iou = self._compute_mask_iou(prev_mask, curr)
+                    unc_scores[ti] = 1.0 - iou
+                    prev_mask = curr
             self._uncertainty_scores = unc_scores
             self._update_uncertainty_markers()
 
