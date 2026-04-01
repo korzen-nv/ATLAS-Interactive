@@ -240,11 +240,12 @@ class GLCanvasWidget(QOpenGLWidget):
         W, H = self.image_w, self.image_h
         K = self.num_classes
 
-        # Image texture: RGB float32
+        # Image texture: RGBA float32 (RGBA required for CUDA interop —
+        # drivers store RGB32F as RGBA internally, causing stride mismatch)
         self._tex_image = glGenTextures(1)
         glBindTexture(GL_TEXTURE_2D, self._tex_image)
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, W, H, 0,
-                     GL_RGB, GL_FLOAT, None)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, W, H, 0,
+                     GL_RGBA, GL_FLOAT, None)
         self._set_tex_params_2d()
 
         # Hard mask texture: R8 (class index 0-255) — NEAREST to avoid interpolation
@@ -477,11 +478,14 @@ class GLCanvasWidget(QOpenGLWidget):
 
     def _cuda_upload_image(self, tensor):
         """Upload (3, H, W) float32 CUDA tensor to image texture."""
-        # Permute to (H, W, 3) contiguous for the memcpy
+        import torch
+        # Permute to (H, W, 3) then pad to (H, W, 4) — RGBA required for CUDA array
         t = tensor.permute(1, 2, 0).contiguous()
+        ones = torch.ones(t.shape[0], t.shape[1], 1, device=t.device, dtype=t.dtype)
+        t = torch.cat([t, ones], dim=2).contiguous()
         self._interop.copy_tensor_to_texture_2d(
             t, self._interop_resources['image'],
-            self.image_w, self.image_h, 3)
+            self.image_w, self.image_h, 4)
 
     def _cuda_upload_prob(self, tensor):
         """Upload (K+1, H, W) float32 CUDA tensor to prob texture array."""

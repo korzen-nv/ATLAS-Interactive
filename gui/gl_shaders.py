@@ -45,7 +45,7 @@ void main() {
 
 # ── Fragment shader ───────────────────────────────────────────────────────
 # Inputs:
-#   tex_image     – GL_TEXTURE_2D,       RGB  float [0,1]   (unit 0)
+#   tex_image     – GL_TEXTURE_2D,       RGBA float [0,1]   (unit 0)
 #   tex_mask      – GL_TEXTURE_2D,       R    uint8→float   (unit 1)
 #   tex_color_map – GL_TEXTURE_1D,       RGB  float [0,1]   (unit 2)
 #   tex_overlay   – GL_TEXTURE_2D,       RGBA float [0,1]   (unit 3)

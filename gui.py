@@ -31,6 +31,10 @@ def get_arguments():
     parser.add_argument('--num_objects', type=int, default=len(custom_palette)//3-1) # //3 because RGB, -1 because background
     parser.add_argument('--workspace_init_only', action='store_true',
                         help='initialize the workspace and exit')
+    parser.add_argument('--no-gl', action='store_true',
+                        help='disable OpenGL canvas, use legacy QLabel display')
+    parser.add_argument('--internal-size', type=int, default=None,
+                        help='override max_internal_size (e.g. 720, 1080)')
 
     args = parser.parse_args()
     return args
@@ -68,6 +72,15 @@ if __name__ in "__main__":
 
     # merge arguments into config
     args = vars(args)
+    # --no-gl flag overrides use_gl_canvas config
+    if args.pop('no_gl', False):
+        with open_dict(cfg):
+            cfg['use_gl_canvas'] = False
+    # --internal-size overrides max_internal_size config
+    internal_size = args.pop('internal_size', None)
+    if internal_size is not None:
+        with open_dict(cfg):
+            cfg['max_internal_size'] = internal_size
     with open_dict(cfg):
         for k, v in args.items():
             assert k not in cfg, f'Argument {k} already exists in config'
