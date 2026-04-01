@@ -1,13 +1,14 @@
 """Persistent cross-video memory store for image/mask exemplar pairs.
 
-Items are organised on disk by workspace (source video) name::
+Items are organised on disk by workspace (source video) name.  Each item
+is stored as a flat triplet of files using the original frame name::
 
     global_memory/
       episode_001.mp4/
-        0000_frame42/  image.jpg  mask.png  meta.json
-        0001_frame99/  image.jpg  mask.png  meta.json
+        frame42.jpg   frame42.png   frame42.json
+        frame99.jpg   frame99.png   frame99.json
       episode_002.mp4/
-        0000_frame10/  image.jpg  mask.png  meta.json
+        frame10.jpg   frame10.png   frame10.json
 """
 from __future__ import annotations
 
@@ -28,15 +29,19 @@ class GlobalMemoryItem:
     name: str
     source_video: str
     frame_idx: int
-    path: Path
+    path: Path          # folder containing the triplet
 
     @property
     def image_path(self) -> Path:
-        return self.path / 'image.jpg'
+        return self.path / f'{self.name}.jpg'
 
     @property
     def mask_path(self) -> Path:
-        return self.path / 'mask.png'
+        return self.path / f'{self.name}.png'
+
+    @property
+    def meta_path(self) -> Path:
+        return self.path / f'{self.name}.json'
 
     def load_image(self) -> np.ndarray:
         img = cv2.imread(str(self.image_path))
@@ -64,8 +69,7 @@ class GlobalMemoryStore:
         for d in sorted(self.store_dir.iterdir()):
             if not d.is_dir():
                 continue
-            count = sum(1 for x in d.iterdir()
-                        if x.is_dir() and (x / 'meta.json').exists())
+            count = sum(1 for x in d.glob('*.json'))
             if count > 0:
                 result.append((d.name, count))
         return result
@@ -76,17 +80,15 @@ class GlobalMemoryStore:
         items: List[GlobalMemoryItem] = []
         if not folder.is_dir():
             return items
-        for d in sorted(folder.iterdir()):
-            meta_path = d / 'meta.json'
-            if d.is_dir() and meta_path.exists():
-                with open(meta_path) as f:
-                    meta = json.load(f)
-                items.append(GlobalMemoryItem(
-                    name=meta.get('name', d.name),
-                    source_video=meta.get('source_video', folder_name),
-                    frame_idx=meta.get('frame_idx', -1),
-                    path=d,
-                ))
+        for meta_path in sorted(folder.glob('*.json')):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            items.append(GlobalMemoryItem(
+                name=meta.get('name', meta_path.stem),
+                source_video=meta.get('source_video', folder_name),
+                frame_idx=meta.get('frame_idx', -1),
+                path=folder,
+            ))
         return items
 
     def all_items(self) -> List[GlobalMemoryItem]:
@@ -114,27 +116,31 @@ class GlobalMemoryStore:
         folder = self.store_dir / source_video
         folder.mkdir(parents=True, exist_ok=True)
 
-        existing = sorted(d for d in folder.iterdir() if d.is_dir())
-        idx = len(existing)
         safe_name = name.replace('/', '_').replace('\\', '_').replace(' ', '_')
-        item_dir = folder / f'{idx:04d}_{safe_name}'
-        item_dir.mkdir(parents=True, exist_ok=True)
 
-        Image.fromarray(image).save(item_dir / 'image.jpg', quality=95)
+        Image.fromarray(image).save(folder / f'{safe_name}.jpg', quality=95)
 
         mask_img = Image.fromarray(mask.astype(np.uint8))
         if palette is not None:
             mask_img.putpalette(palette)
-        mask_img.save(item_dir / 'mask.png')
+        mask_img.save(folder / f'{safe_name}.png')
 
-        meta = {'name': name, 'source_video': source_video, 'frame_idx': frame_idx}
-        with open(item_dir / 'meta.json', 'w') as f:
+        meta = {'name': safe_name, 'source_video': source_video, 'frame_idx': frame_idx}
+        with open(folder / f'{safe_name}.json', 'w') as f:
             json.dump(meta, f, indent=2)
 
         return GlobalMemoryItem(
-            name=name, source_video=source_video,
-            frame_idx=frame_idx, path=item_dir,
+            name=safe_name, source_video=source_video,
+            frame_idx=frame_idx, path=folder,
         )
+
+    def remove_item(self, folder_name: str, item_name: str) -> None:
+        """Remove a single item (its .jpg, .png, .json) from a folder."""
+        folder = self.store_dir / folder_name
+        for ext in ('.jpg', '.png', '.json'):
+            p = folder / f'{item_name}{ext}'
+            if p.exists():
+                p.unlink()
 
     def remove_folder(self, folder_name: str) -> None:
         folder = self.store_dir / folder_name
