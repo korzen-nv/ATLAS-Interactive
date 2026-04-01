@@ -35,6 +35,8 @@ def get_arguments():
                         help='disable OpenGL canvas, use legacy QLabel display')
     parser.add_argument('--internal-size', type=int, default=None,
                         help='override max_internal_size (e.g. 720, 1080)')
+    parser.add_argument('--profile', action='store_true',
+                        help='enable CUDA step profiler (prints timing every 50 frames)')
 
     args = parser.parse_args()
     return args
@@ -81,6 +83,11 @@ if __name__ in "__main__":
     if internal_size is not None:
         with open_dict(cfg):
             cfg['max_internal_size'] = internal_size
+    # --profile enables CUDA step profiler
+    profile = args.pop('profile', False)
+    if profile:
+        with open_dict(cfg):
+            cfg['profile'] = True
     with open_dict(cfg):
         for k, v in args.items():
             assert k not in cfg, f'Argument {k} already exists in config'

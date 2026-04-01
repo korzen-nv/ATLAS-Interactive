@@ -33,6 +33,7 @@ from gui.global_memory import GlobalMemoryStore
 
 from gui.cutie.utils.palette import custom_palette_np # added
 from gui.crf_refine import apply_crf as _apply_crf, is_available as _crf_available
+from gui.torch_rt import TorchRT
 
 log = logging.getLogger()
 
@@ -207,8 +208,21 @@ class MainController():
             QTimer.singleShot(3000, lambda: self.gui.progressbar.setValue(0))
 
     def initialize_networks(self) -> None:
+        # TorchRT: compiled resize ops for fixed resolution pairs (720 / 1080)
+        internal_sizes = {720, 1080}
+        mis = self.cfg.get('max_internal_size', 0)
+        if mis > 0:
+            internal_sizes.add(mis)
+        self.torch_rt = TorchRT(
+            canvas_hw=(self.res_man.h, self.res_man.w),
+            internal_sizes=sorted(internal_sizes),
+            device=self.device,
+        )
+        log.info("TorchRT: %s", self.torch_rt)
+
         self._propagation, self.click_ctrl = create_backends(
             self.cfg, self.device, image_dir=self.res_man.image_dir,
+            torch_rt=self.torch_rt,
         )
         self._auto_seg = None  # lazy-loaded on first use
 

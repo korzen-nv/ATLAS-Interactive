@@ -1,4 +1,6 @@
-from typing import List, Optional, Iterable, Dict
+from __future__ import annotations
+
+from typing import List, Optional, Iterable, Dict, TYPE_CHECKING
 import logging
 from omegaconf import DictConfig
 
@@ -12,7 +14,62 @@ from gui.cutie.inference.image_feature_store import ImageFeatureStore
 from gui.cutie.model.cutie import CUTIE
 from gui.cutie.utils.tensor_utils import pad_divide_by, unpad, aggregate
 
+if TYPE_CHECKING:
+    from gui.torch_rt import TorchRT
+
 log = logging.getLogger()
+
+
+class _StepProfiler:
+    """Lightweight CUDA-event profiler for InferenceCore.step().
+
+    When disabled, all methods are no-ops (zero overhead).
+    Enable with ``inference_core.profiler.enabled = True``.
+    Results are printed every ``print_every`` frames.
+    """
+    def __init__(self, print_every: int = 50):
+        self.enabled = False
+        self.print_every = print_every
+        self._events: list = []
+        self._labels: list = []
+        self._count = 0
+        self._accum: Dict[str, float] = {}
+
+    def mark(self, label: str) -> None:
+        if not self.enabled:
+            return
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        self._events.append(ev)
+        self._labels.append(label)
+
+    def finish_frame(self) -> None:
+        if not self.enabled or len(self._events) < 2:
+            self._events.clear()
+            self._labels.clear()
+            return
+        torch.cuda.synchronize()
+        for i in range(len(self._events) - 1):
+            name = f"{self._labels[i]} → {self._labels[i+1]}"
+            ms = self._events[i].elapsed_time(self._events[i + 1])
+            self._accum[name] = self._accum.get(name, 0.0) + ms
+        total_name = f"TOTAL ({self._labels[0]} → {self._labels[-1]})"
+        total_ms = self._events[0].elapsed_time(self._events[-1])
+        self._accum[total_name] = self._accum.get(total_name, 0.0) + total_ms
+        self._count += 1
+        if self._count >= self.print_every:
+            self._print()
+        self._events.clear()
+        self._labels.clear()
+
+    def _print(self) -> None:
+        n = self._count
+        print(f"\n=== Step profiler ({n} frames) ===")
+        for name, total_ms in self._accum.items():
+            print(f"  {name:<40s} {total_ms / n:6.2f} ms/frame")
+        print()
+        self._accum.clear()
+        self._count = 0
 
 
 class InferenceCore:
@@ -21,7 +78,10 @@ class InferenceCore:
                  network: CUTIE,
                  cfg: DictConfig,
                  *,
-                 image_feature_store: ImageFeatureStore = None):
+                 image_feature_store: ImageFeatureStore = None,
+                 torch_rt: Optional[TorchRT] = None,
+                 trt_encoder=None,
+                 trt_mask_decoder=None):
         self.network = network
         self.cfg = cfg
         self.mem_every = cfg.mem_every
@@ -30,6 +90,7 @@ class InferenceCore:
         self.save_aux = cfg.save_aux
         self.max_internal_size = cfg.max_internal_size
         self.flip_aug = cfg.flip_aug
+        self.torch_rt = torch_rt
 
         self.curr_ti = -1
         self.last_mem_ti = 0
@@ -43,10 +104,14 @@ class InferenceCore:
         self.memory = MemoryManager(cfg=cfg, object_manager=self.object_manager)
 
         if image_feature_store is None:
-            self.image_feature_store = ImageFeatureStore(self.network)
+            self.image_feature_store = ImageFeatureStore(
+                self.network, trt_encoder=trt_encoder)
         else:
             self.image_feature_store = image_feature_store
 
+        self.trt_mask_decoder = trt_mask_decoder
+        self.profiler = _StepProfiler()
+        self.profiler.enabled = cfg.get('profile', False)
         self.last_mask = None
 
     def clear_memory(self):
@@ -150,23 +215,40 @@ class InferenceCore:
                                device=key.device,
                                dtype=key.dtype)
 
+        self.profiler.mark('mem_read')
         memory_readout = self.memory.read(pix_feat, key, selection, self.last_mask, self.network)
         memory_readout = self.object_manager.realize_dict(memory_readout)
-        sensory, _, pred_prob_with_bg = self.network.segment(ms_features,
-                                                             memory_readout,
-                                                             self.memory.get_sensory(
-                                                                 self.object_manager.all_obj_ids),
-                                                             chunk_size=self.chunk_size,
-                                                             update_sensory=update_sensory)
-        # remove batch dim
-        if self.flip_aug:
-            # average predictions of the non-flipped and flipped version
-            pred_prob_with_bg = (pred_prob_with_bg[0] +
-                                 torch.flip(pred_prob_with_bg[1], dims=[-1])) / 2
+        self.profiler.mark('mask_decode')
+        current_sensory = self.memory.get_sensory(self.object_manager.all_obj_ids)
+        if (self.trt_mask_decoder is not None
+                and not self.flip_aug and memory_readout.shape[0] == 1):
+            # TRT mask decoder: run decoder + sensory update in one engine call
+            new_sensory, logits = self.trt_mask_decoder(
+                ms_features[1],   # f8
+                ms_features[2],   # f4
+                memory_readout,
+                current_sensory,
+            )
+            # Post-processing (same as CUTIE.segment)
+            prob = torch.sigmoid(logits)
+            logits_agg = aggregate(prob, dim=1)
+            logits_agg = F.interpolate(logits_agg, scale_factor=4,
+                                       mode='bilinear', align_corners=False)
+            pred_prob_with_bg = F.softmax(logits_agg, dim=1)[0]
+            if update_sensory:
+                self.memory.update_sensory(new_sensory, self.object_manager.all_obj_ids)
         else:
-            pred_prob_with_bg = pred_prob_with_bg[0]
-        if update_sensory:
-            self.memory.update_sensory(sensory, self.object_manager.all_obj_ids)
+            sensory, _, pred_prob_with_bg = self.network.segment(
+                ms_features, memory_readout, current_sensory,
+                chunk_size=self.chunk_size, update_sensory=update_sensory)
+            # remove batch dim
+            if self.flip_aug:
+                pred_prob_with_bg = (pred_prob_with_bg[0] +
+                                     torch.flip(pred_prob_with_bg[1], dims=[-1])) / 2
+            else:
+                pred_prob_with_bg = pred_prob_with_bg[0]
+            if update_sensory:
+                self.memory.update_sensory(sensory, self.object_manager.all_obj_ids)
         return pred_prob_with_bg
 
     def step(self,
@@ -210,24 +292,33 @@ class InferenceCore:
             min_side = min(h, w)
             if min_side > self.max_internal_size:
                 resize_needed = True
-                new_h = int(h / min_side * self.max_internal_size)
-                new_w = int(w / min_side * self.max_internal_size)
-                image = F.interpolate(image.unsqueeze(0),
-                                      size=(new_h, new_w),
-                                      mode='bilinear',
-                                      align_corners=False)[0]
-                if mask is not None:
-                    if idx_mask:
-                        mask = F.interpolate(mask.unsqueeze(0).unsqueeze(0).float(),
-                                             size=(new_h, new_w),
-                                             mode='nearest-exact')[0, 0].round().long()
-                    else:
-                        mask = F.interpolate(mask.unsqueeze(0),
-                                             size=(new_h, new_w),
-                                             mode='bilinear',
-                                             align_corners=False)[0]
+                if self.torch_rt is not None:
+                    image = self.torch_rt.resize_image_down(image, self.max_internal_size)
+                    if mask is not None:
+                        if idx_mask:
+                            mask = self.torch_rt.resize_mask_down(mask, self.max_internal_size)
+                        else:
+                            mask = self.torch_rt.resize_prob_down(mask, self.max_internal_size)
+                else:
+                    new_h = int(h / min_side * self.max_internal_size)
+                    new_w = int(w / min_side * self.max_internal_size)
+                    image = F.interpolate(image.unsqueeze(0),
+                                          size=(new_h, new_w),
+                                          mode='bilinear',
+                                          align_corners=False)[0]
+                    if mask is not None:
+                        if idx_mask:
+                            mask = F.interpolate(mask.unsqueeze(0).unsqueeze(0).float(),
+                                                 size=(new_h, new_w),
+                                                 mode='nearest-exact')[0, 0].long()
+                        else:
+                            mask = F.interpolate(mask.unsqueeze(0),
+                                                 size=(new_h, new_w),
+                                                 mode='bilinear',
+                                                 align_corners=False)[0]
 
         self.curr_ti += 1
+        self.profiler.mark('start')
 
         image, self.pad = pad_divide_by(image, 16)
         image = image.unsqueeze(0)  # add the batch dimension
@@ -243,10 +334,12 @@ class InferenceCore:
         update_sensory = ((self.curr_ti - self.last_mem_ti) in self.stagger_ti) and (not end)
 
         # encoding the image
+        self.profiler.mark('encode')
         ms_feat, pix_feat = self.image_feature_store.get_features(self.curr_ti, image)
         key, shrinkage, selection = self.image_feature_store.get_key(self.curr_ti, image)
 
         # segmentation from memory if needed
+        self.profiler.mark('segment')
         if need_segment:
             pred_prob_with_bg = self._segment(key,
                                               selection,
@@ -305,6 +398,7 @@ class InferenceCore:
                 [self.last_mask, torch.flip(self.last_mask, dims=[-1])], dim=0)
 
         # save as memory if needed
+        self.profiler.mark('add_mem')
         if is_mem_frame or force_permanent:
             self._add_memory(image,
                              pix_feat,
@@ -317,14 +411,20 @@ class InferenceCore:
         if delete_buffer:
             self.image_feature_store.delete(self.curr_ti)
 
+        self.profiler.mark('resize_up')
         output_prob = unpad(pred_prob_with_bg, self.pad)
         if resize_needed:
             # restore output to the original size
-            output_prob = F.interpolate(output_prob.unsqueeze(0),
-                                        size=(h, w),
-                                        mode='bilinear',
-                                        align_corners=False)[0]
+            if self.torch_rt is not None:
+                output_prob = self.torch_rt.resize_prob_up(output_prob, self.max_internal_size)
+            else:
+                output_prob = F.interpolate(output_prob.unsqueeze(0),
+                                            size=(h, w),
+                                            mode='bilinear',
+                                            align_corners=False)[0]
 
+        self.profiler.mark('done')
+        self.profiler.finish_frame()
         return output_prob
 
     def delete_objects(self, objects: List[int]) -> None:

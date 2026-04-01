@@ -53,6 +53,7 @@ dependencies = [
   'pydensecrf2>=1.0',
   "pyopengl>=3.1.10",
   "torchao>=0.17.0",
+  "onnxscript>=0.6.2",
 ]
 
 [project.optional-dependencies]

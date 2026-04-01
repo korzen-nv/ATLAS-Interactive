@@ -77,6 +77,75 @@ def do_softmax(
     return affinity
 
 
+def do_softmax_sparse(
+        similarity: torch.Tensor,
+        top_k: int,
+        return_usage: bool = False,
+) -> tuple:
+    """Top-k softmax returning sparse format for efficient gather-based readout.
+
+    Instead of scattering weights into a dense (N × HW) matrix and doing a full
+    BMM (99.7% multiply-by-zero when top_k=30, N=10000), this keeps only the
+    top-k indices and weights so ``sparse_readout`` can gather just what it needs.
+
+    Args:
+        similarity: (bs, N, HW)
+        top_k: number of entries to keep per spatial position
+
+    Returns:
+        topk_weights: (bs, top_k, HW) — normalised softmax weights
+        topk_indices: (bs, top_k, HW) — indices into N dimension
+        usage (optional): (bs, N) — per-token sum of weights across HW
+    """
+    values, indices = torch.topk(similarity, k=top_k, dim=1)
+    x_exp = values.exp_()
+    x_exp /= torch.sum(x_exp, dim=1, keepdim=True)
+
+    if return_usage:
+        bs, N = similarity.shape[0], similarity.shape[1]
+        usage = torch.zeros(bs, N, device=similarity.device, dtype=x_exp.dtype)
+        usage.scatter_add_(1, indices.reshape(bs, -1), x_exp.reshape(bs, -1))
+        return x_exp, indices, usage
+
+    return x_exp, indices
+
+
+def sparse_readout(
+        v: torch.Tensor,
+        topk_indices: torch.Tensor,
+        topk_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Memory readout using sparse top-k affinity (gather instead of dense BMM).
+
+    Args:
+        v: (bs, C, N) or (bs, num_objects, C, N) — memory values
+        topk_indices: (bs, top_k, HW) — indices into N dimension
+        topk_weights: (bs, top_k, HW) — normalised weights
+
+    Returns:
+        (bs, C, HW) or (bs, num_objects, C, HW)
+    """
+    multi_obj = v.dim() == 4
+    if multi_obj:
+        bs, num_objects, CV, N = v.shape
+        v = v.reshape(bs, num_objects * CV, N)
+
+    bs, C, N = v.shape
+    top_k = topk_indices.shape[1]
+    HW = topk_indices.shape[2]
+
+    # Gather top-k values along N:  (bs, C, top_k*HW)
+    idx = topk_indices.reshape(bs, 1, top_k * HW).expand(bs, C, -1)
+    gathered = torch.gather(v, 2, idx).view(bs, C, top_k, HW)
+
+    # Weighted sum over top_k dimension
+    out = (gathered * topk_weights.unsqueeze(1)).sum(2)   # (bs, C, HW)
+
+    if multi_obj:
+        out = out.view(bs, num_objects, CV, HW)
+    return out
+
+
 def get_affinity(mk: torch.Tensor, ms: torch.Tensor, qk: torch.Tensor,
                  qe: torch.Tensor) -> torch.Tensor:
     # shorthand used in training with no top-k
