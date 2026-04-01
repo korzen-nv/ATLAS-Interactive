@@ -147,6 +147,7 @@ def _create_cutie(cfg, device, shared_model, *, torch_rt=None):
 
     trt_encoder = None
     trt_mask_decoder = None
+    trt_readout = None
 
     if shared_model is not None:
         cutie = shared_model
@@ -159,7 +160,7 @@ def _create_cutie(cfg, device, shared_model, *, torch_rt=None):
 
         # --- TRT engines (must happen BEFORE FP8 / torch.compile) ---
         if torch_rt is not None and cfg.get('tensorrt', True):
-            trt_encoder, trt_mask_decoder = _try_build_trt(
+            trt_encoder, trt_mask_decoder, trt_readout = _try_build_trt(
                 cutie, cfg, torch_rt, device)
 
         # GPU optimisation: FP8 weight quantize, then torch.compile
@@ -171,7 +172,8 @@ def _create_cutie(cfg, device, shared_model, *, torch_rt=None):
 
     propagation = CutieBackend(cutie, cfg, torch_rt=torch_rt,
                                trt_encoder=trt_encoder,
-                               trt_mask_decoder=trt_mask_decoder)
+                               trt_mask_decoder=trt_mask_decoder,
+                               trt_readout=trt_readout)
     click = RitmClickBackend(cfg.ritm_weights, device=device)
     return propagation, click
 
@@ -189,15 +191,16 @@ def _get_padded_hw(cfg, torch_rt):
 
 
 def _try_build_trt(cutie, cfg, torch_rt, device):
-    """Attempt to build TRT engines for the CUTIE encoder + mask decoder."""
+    """Attempt to build TRT engines for encoder, mask decoder, and readout."""
     try:
-        from gui.trt_engine import TRTEncoder, TRTMaskDecoder
+        from gui.trt_engine import TRTEncoder, TRTMaskDecoder, TRTReadout
     except ImportError:
-        return None, None
+        return None, None, None
 
     ph, pw = _get_padded_hw(cfg, torch_rt)
     weights_path = cfg.get('weights', '')
     fp16 = cfg.get('amp', True)
+    NO = cfg.num_objects
 
     trt_encoder = TRTEncoder.build(
         cutie, (ph, pw),
@@ -205,11 +208,15 @@ def _try_build_trt(cutie, cfg, torch_rt, device):
     )
 
     trt_mask_decoder = TRTMaskDecoder.build(
-        cutie, (ph, pw), cfg.num_objects,
+        cutie, (ph, pw), NO,
         weights_path=weights_path, fp16=fp16, device=device,
     )
 
-    return trt_encoder, trt_mask_decoder
+    # TRT readout disabled — ONNX export of nn.MultiheadAttention with
+    # boolean/float-inf masks produces NaN in TRT. Use torch.compile instead.
+    trt_readout = None
+
+    return trt_encoder, trt_mask_decoder, trt_readout
 
 
 # -- SAM 2 --------------------------------------------------------------------

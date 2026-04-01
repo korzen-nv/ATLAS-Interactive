@@ -20,6 +20,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 log = logging.getLogger(__name__)
 
@@ -624,4 +625,329 @@ class TRTMaskDecoder:
             return TRTMaskDecoder(engine_bytes, device=device)
         except Exception as exc:
             log.warning("TRTMaskDecoder: build failed — %s", exc)
+            return None
+
+
+# ===================================================================
+# Readout Pipeline TRT  (pixel_fusion + object_transformer)
+# ===================================================================
+
+READOUT_INPUT_NAMES = [
+    "pix_feat", "visual_readout", "sensory", "last_mask_ds", "obj_summaries",
+]
+READOUT_OUTPUT_NAMES = ["readout"]
+
+
+class _ReadoutPipelineONNXWrapper(nn.Module):
+    """Combines pixel_fusion + object_transformer for ONNX export.
+
+    Fixed ``num_objects`` and spatial dims.  Precomputes positional encoding
+    and replaces ``_get_aux_mask``'s ``torch.where`` with static-shape ops.
+    """
+
+    def __init__(
+        self, cutie: nn.Module, num_objects: int, h16: int, w16: int
+    ) -> None:
+        super().__init__()
+        self.NO = num_objects
+
+        # --- PixelFeatureFuser ---
+        pf = cutie.pixel_fuser
+        self.sensory_compress = pf.sensory_compress
+        self.fuser = pf.fuser
+
+        # --- QueryTransformer ---
+        qt = cutie.object_transformer
+        self.query_init = qt.query_init
+        self.query_emb = qt.query_emb
+        self.summary_to_query_init = qt.summary_to_query_init
+        self.summary_to_query_emb = qt.summary_to_query_emb
+        self.pixel_init_proj = qt.pixel_init_proj
+        self.pixel_emb_proj = qt.pixel_emb_proj
+        self.blocks = qt.blocks
+        self.mask_pred = qt.mask_pred
+        self.num_heads = qt.num_heads
+        self.num_queries = qt.num_queries
+        self.embed_dim = qt.embed_dim
+
+        # Precompute spatial positional encoding with batch=num_objects
+        # (avoids dynamic arange/cache in ONNX export)
+        with torch.no_grad():
+            dev = next(cutie.parameters()).device
+            dummy = torch.zeros(num_objects, qt.embed_dim, h16, w16, device=dev)
+            pe = qt.spatial_pe(dummy)  # (num_objects, h16, w16, embed_dim)
+        self.register_buffer("pixel_pe_const", pe)
+
+    def forward(
+        self,
+        pix_feat: torch.Tensor,
+        visual_readout: torch.Tensor,
+        sensory: torch.Tensor,
+        last_mask_ds: torch.Tensor,
+        obj_summaries: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        pix_feat:        (1, 256, H16, W16)
+        visual_readout:  (1, NO, 256, H16, W16)
+        sensory:         (1, NO, 256, H16, W16)
+        last_mask_ds:    (1, NO, H16, W16) — already downsampled to stride 16
+        obj_summaries:   (1, NO, 1, 16, 257) — object memory (T=1)
+
+        Returns:
+            readout: (1, NO, 256, H16, W16)
+        """
+        NO = self.NO
+
+        # ==================== PixelFeatureFuser ====================
+        # _get_others: for each object, sum of all other objects' masks
+        last_others = (
+            last_mask_ds.sum(1, keepdim=True) - last_mask_ds
+        ).clamp(0, 1)
+        mask_ch = torch.stack([last_mask_ds, last_others], dim=2)  # (1,NO,2,H,W)
+
+        sensory_in = torch.cat([sensory, mask_ch], dim=2)  # (1,NO,258,H,W)
+        sensory_rd = self.sensory_compress(sensory_in)  # (1,NO,256,H,W)
+        p16 = visual_readout + sensory_rd
+        p16 = self.fuser(pix_feat, p16)  # (1,NO,256,H,W)
+
+        # ==================== QueryTransformer ====================
+        pixel = p16
+        H, W = pixel.shape[3], pixel.shape[4]
+
+        # --- query initialisation from obj_summaries (T=1) ---
+        osf = obj_summaries.view(NO, 1, self.num_queries, self.embed_dim + 1)
+        obj_sums = osf[:, 0, :, :-1]  # (NO, 16, 256)
+        obj_area = osf[:, 0, :, -1:]  # (NO, 16, 1)
+        obj_values = obj_sums / (obj_area + 1e-4)
+
+        query = (
+            self.query_init.weight.unsqueeze(0).expand(NO, -1, -1)
+            + self.summary_to_query_init(obj_values)
+        )
+        query_emb = (
+            self.query_emb.weight.unsqueeze(0).expand(NO, -1, -1)
+            + self.summary_to_query_emb(obj_values)
+        )
+
+        # --- pixel projections + PE ---
+        pixel_init = self.pixel_init_proj(pixel)
+        pixel_emb = self.pixel_emb_proj(pixel)
+
+        pixel_pe = self.pixel_pe_const.flatten(1, 2)  # (NO, H*W, embed_dim)
+        pixel_emb_flat = (
+            pixel_emb.flatten(3, 4).flatten(0, 1).transpose(1, 2).contiguous()
+        )
+        pixel_pe = pixel_pe + pixel_emb_flat
+
+        pixel = pixel_init
+
+        # --- transformer blocks ---
+        aux_logits = self.mask_pred[0](pixel).squeeze(2)  # (1,NO,H,W)
+        attn_mask = self._aux_mask(aux_logits, H, W)
+
+        for i in range(len(self.blocks)):
+            query, pixel, _, _ = self.blocks[i](
+                query, pixel, query_emb, pixel_pe, attn_mask, need_weights=False
+            )
+            aux_logits = self.mask_pred[i + 1](pixel).squeeze(2)
+            attn_mask = self._aux_mask(aux_logits, H, W)
+
+        return pixel  # (1, NO, 256, H16, W16)
+
+    # ----------------------------------------------------------------
+    def _aux_mask(
+        self, logits: torch.Tensor, H: int, W: int
+    ) -> torch.Tensor:
+        """Static-shape replacement for QueryTransformer._get_aux_mask.
+
+        Uses ``& ~all_masked`` instead of ``torch.where`` to avoid
+        variable-length indexing that TRT cannot handle.
+        """
+        prob = logits.sigmoid()  # (1, NO, H, W)
+
+        # aggregate: background = prod(1-p), then log-odds
+        bg = torch.prod(1 - prob, dim=1, keepdim=True)
+        all_p = torch.cat([bg, prob], dim=1).clamp(1e-7, 1 - 1e-7)
+        lo = torch.log(all_p / (1 - all_p + 1e-7))
+
+        is_fg = lo[:, 1:] >= lo.max(dim=1, keepdim=True)[0]  # (1,NO,H,W)
+        fg_flat = is_fg.flatten(2)  # (1, NO, H*W)
+        inv_fg = ~fg_flat
+        inv_bg = fg_flat
+
+        NH = self.num_heads
+        NQ2 = self.num_queries // 2
+        HW = H * W
+
+        # (1, NO, NH, NQ//2, HW)
+        m_fg = inv_fg.unsqueeze(2).unsqueeze(2).expand(-1, -1, NH, NQ2, HW)
+        m_bg = inv_bg.unsqueeze(2).unsqueeze(2).expand(-1, -1, NH, NQ2, HW)
+        aux = torch.cat([m_fg, m_bg], dim=3)  # (1,NO,NH,NQ,HW)
+        aux = aux.reshape(-1, self.num_queries, HW)  # (NO*NH,NQ,HW)
+
+        # Un-block queries where ALL spatial positions are masked
+        all_blocked = aux.sum(-1, keepdim=True) == HW
+        aux = aux & ~all_blocked
+
+        # Convert boolean → float additive mask for ONNX compatibility.
+        # nn.MultiheadAttention does this internally in PyTorch, but the
+        # conversion may not survive ONNX export correctly.
+        # True (blocked) → -inf,  False (allowed) → 0.0
+        float_mask = torch.zeros(
+            aux.shape, dtype=torch.float32, device=aux.device
+        )
+        float_mask.masked_fill_(aux, float("-inf"))
+        return float_mask
+
+
+class TRTReadout:
+    """Runs pixel_fusion + object_transformer on a TRT engine."""
+
+    def __init__(self, engine_bytes: bytes, device: str = "cuda") -> None:
+        if not _TRT_AVAILABLE:
+            raise RuntimeError("tensorrt not installed")
+
+        self._device = torch.device(device)
+        trt_logger = trt.Logger(trt.Logger.WARNING)
+        runtime = trt.Runtime(trt_logger)
+        with torch.cuda.device(self._device):
+            self._engine = runtime.deserialize_cuda_engine(engine_bytes)
+        self._context = self._engine.create_execution_context()
+
+        self._input_specs: dict[str, Tuple[tuple, torch.dtype]] = {}
+        self._output_specs: dict[str, Tuple[tuple, torch.dtype]] = {}
+        for i in range(self._engine.num_io_tensors):
+            name = self._engine.get_tensor_name(i)
+            mode = self._engine.get_tensor_mode(name)
+            shape = tuple(self._engine.get_tensor_shape(name))
+            dtype = _TRT_TO_TORCH.get(
+                self._engine.get_tensor_dtype(name), torch.float32
+            )
+            if mode == trt.TensorIOMode.INPUT:
+                self._input_specs[name] = (shape, dtype)
+            else:
+                self._output_specs[name] = (shape, dtype)
+
+        self.num_objects = self._input_specs["visual_readout"][0][1]
+        log.info(
+            "TRTReadout: ready (num_objects=%d, %d inputs, %d outputs)",
+            self.num_objects,
+            len(self._input_specs),
+            len(self._output_specs),
+        )
+
+    def __call__(
+        self,
+        pix_feat: torch.Tensor,
+        visual_readout: torch.Tensor,
+        sensory: torch.Tensor,
+        last_mask_ds: torch.Tensor,
+        obj_summaries: torch.Tensor,
+    ) -> torch.Tensor:
+        actual_no = visual_readout.shape[1]
+        need_pad = actual_no < self.num_objects
+
+        if need_pad:
+            pad_no = self.num_objects - actual_no
+            visual_readout = F.pad(visual_readout, (0,0,0,0,0,0,0,pad_no))
+            sensory = F.pad(sensory, (0,0,0,0,0,0,0,pad_no))
+            last_mask_ds = F.pad(last_mask_ds, (0,0,0,0,0,pad_no))
+            obj_summaries = F.pad(obj_summaries, (0,0,0,0,0,0,0,pad_no))
+
+        inputs = {
+            "pix_feat": pix_feat.contiguous().float(),
+            "visual_readout": visual_readout.contiguous().float(),
+            "sensory": sensory.contiguous().float(),
+            "last_mask_ds": last_mask_ds.contiguous().float(),
+            "obj_summaries": obj_summaries.contiguous().float(),
+        }
+        outputs: dict[str, torch.Tensor] = {}
+        for name, (shape, dtype) in self._output_specs.items():
+            outputs[name] = torch.empty(shape, dtype=dtype, device=self._device)
+
+        for name, tensor in inputs.items():
+            self._context.set_tensor_address(name, tensor.data_ptr())
+        for name, tensor in outputs.items():
+            self._context.set_tensor_address(name, tensor.data_ptr())
+
+        stream = torch.cuda.current_stream(self._device)
+        ok = self._context.execute_async_v3(stream.cuda_stream)
+        if not ok:
+            raise RuntimeError("TRTReadout: execute_async_v3 failed")
+
+        readout = outputs["readout"]
+        if need_pad:
+            readout = readout[:, :actual_no]
+        return readout
+
+    @staticmethod
+    def build(
+        cutie: nn.Module,
+        input_hw: Tuple[int, int],
+        num_objects: int,
+        *,
+        weights_path: str = "",
+        cache_dir: Optional[str] = None,
+        fp16: bool = True,
+        device: str = "cuda",
+    ) -> Optional["TRTReadout"]:
+        if not _TRT_AVAILABLE:
+            log.info("TRTReadout: tensorrt not installed — skipping")
+            return None
+
+        h, w = input_hw
+        h16, w16 = h // 16, w // 16
+        NO = num_objects
+        gpu_name = torch.cuda.get_device_name(device).replace(" ", "_")
+
+        w_mtime = ""
+        if weights_path and os.path.exists(weights_path):
+            w_mtime = str(int(os.path.getmtime(weights_path)))
+        key_str = (
+            f"readout_{h}x{w}_no{NO}_{gpu_name}_trt{trt.__version__}_{w_mtime}"
+        )
+        key_hash = hashlib.sha256(key_str.encode()).hexdigest()[:16]
+
+        if cache_dir is None:
+            cache_dir = str(Path.home() / ".cache" / "atlas-trt")
+        cache_path = Path(cache_dir)
+        cache_path.mkdir(parents=True, exist_ok=True)
+        engine_file = cache_path / f"{key_hash}.engine"
+
+        if engine_file.exists():
+            log.info("TRTReadout: loading cached %s", engine_file)
+            try:
+                return TRTReadout(engine_file.read_bytes(), device=device)
+            except Exception as exc:
+                log.warning("TRTReadout: cache load failed (%s), rebuilding", exc)
+                engine_file.unlink(missing_ok=True)
+
+        log.info(
+            "TRTReadout: building %dx%d NO=%d on %s (first-time only) ...",
+            h, w, NO, gpu_name,
+        )
+
+        try:
+            wrapper = _ReadoutPipelineONNXWrapper(
+                cutie, NO, h16, w16,
+            ).eval().to(device)
+            dummy = (
+                torch.randn(1, 256, h16, w16, device=device),         # pix_feat
+                torch.randn(1, NO, 256, h16, w16, device=device),     # visual_readout
+                torch.randn(1, NO, 256, h16, w16, device=device),     # sensory
+                torch.randn(1, NO, h16, w16, device=device),          # last_mask_ds
+                torch.randn(1, NO, 1, 16, 257, device=device),        # obj_summaries
+            )
+            engine_bytes = _onnx_to_trt(
+                wrapper, dummy,
+                READOUT_INPUT_NAMES, READOUT_OUTPUT_NAMES,
+                cache_path, key_hash, engine_file, fp16,
+                label="TRTReadout",
+                workspace_gb=8,
+            )
+            if engine_bytes is None:
+                return None
+            return TRTReadout(engine_bytes, device=device)
+        except Exception as exc:
+            log.warning("TRTReadout: build failed — %s", exc)
             return None

@@ -13,11 +13,13 @@ class CutieBackend:
     """Wraps InferenceCore to satisfy the PropagationBackend protocol."""
 
     def __init__(self, cutie_model, cfg: DictConfig, *, torch_rt=None,
-                 trt_encoder=None, trt_mask_decoder=None) -> None:
+                 trt_encoder=None, trt_mask_decoder=None,
+                 trt_readout=None) -> None:
         from gui.cutie.inference.inference_core import InferenceCore
         self._core = InferenceCore(cutie_model, cfg, torch_rt=torch_rt,
                                    trt_encoder=trt_encoder,
-                                   trt_mask_decoder=trt_mask_decoder)
+                                   trt_mask_decoder=trt_mask_decoder,
+                                   trt_readout=trt_readout)
         self._cfg = cfg
 
     # -- PropagationBackend interface ------------------------------------------

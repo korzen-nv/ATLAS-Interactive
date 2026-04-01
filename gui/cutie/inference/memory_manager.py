@@ -110,7 +110,8 @@ class MemoryManager:
         return value
 
     def read(self, pix_feat: torch.Tensor, query_key: torch.Tensor, selection: torch.Tensor,
-             last_mask: torch.Tensor, network: CUTIE) -> Dict[int, torch.Tensor]:
+             last_mask: torch.Tensor, network: CUTIE,
+             readout_fn=None) -> Dict[int, torch.Tensor]:
         """
         Read from all memory stores and returns a single memory readout tensor for each object
 
@@ -184,11 +185,24 @@ class MemoryManager:
                 visual_readout = sparse_readout(
                     this_msk_value, topk_indices, topk_weights,
                 ).view(bs, len(objects), self.CV, h, w)
-                pixel_readout = network.pixel_fusion(pix_feat, visual_readout, this_sensory,
-                                                     this_last_mask)
+
                 this_obj_mem = self._get_object_mem_by_ids(objects)
                 this_obj_mem = this_obj_mem.unsqueeze(2) if this_obj_mem is not None else None
-                readout_memory, aux_features = network.readout_query(pixel_readout, this_obj_mem)
+
+                if readout_fn is not None:
+                    # TRT path: caller-provided function replaces
+                    # pixel_fusion + readout_query
+                    readout_memory = readout_fn(
+                        pix_feat, visual_readout, this_sensory,
+                        this_last_mask, this_obj_mem,
+                    )
+                    aux_features = None
+                else:
+                    pixel_readout = network.pixel_fusion(
+                        pix_feat, visual_readout, this_sensory, this_last_mask)
+                    readout_memory, aux_features = network.readout_query(
+                        pixel_readout, this_obj_mem)
+
                 for i, obj in enumerate(objects):
                     all_readout_mem[obj] = readout_memory[:, i]
 
