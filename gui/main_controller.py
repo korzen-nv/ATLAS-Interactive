@@ -195,6 +195,22 @@ class MainController():
         self.gui.set_object_color(self.curr_object)
         self.gui.highlight_selected_class(self.curr_object)
         self.update_config()
+        self._maybe_schedule_startup_automation()
+
+    def _maybe_schedule_startup_automation(self) -> None:
+        if not self.cfg.get('auto_propagate_forward', False):
+            return
+
+        from PySide6.QtCore import QTimer
+
+        QTimer.singleShot(750, self._auto_start_forward_propagation)
+
+    def _auto_start_forward_propagation(self) -> None:
+        if not self.initialized or self.propagating:
+            return
+
+        self.gui.text('Auto-starting forward propagation.')
+        self.on_forward_propagation()
 
     def _on_preload_progress(self):
         progress = self.res_man.preload_progress()
@@ -764,6 +780,8 @@ class MainController():
             import time
             _THROTTLE_N = max(1, self.gui.display_skip_slider.value())
             _prop_t0 = time.perf_counter()
+            _auto_pause_after = self.cfg.get('auto_pause_after', None)
+            _auto_paused = False
             _prop_frames = 0
 
             # Pending results from previous iteration (to process while GPU is busy)
@@ -798,6 +816,11 @@ class MainController():
             for data in loader:
                 if not self.propagating:
                     break
+                if _auto_pause_after is not None and _auto_pause_after > 0:
+                    if (time.perf_counter() - _prop_t0) >= _auto_pause_after:
+                        _auto_paused = True
+                        self.propagating = False
+                        break
 
                 curr_image_np, curr_image_torch = data
                 curr_image_torch = curr_image_torch.to(self.device, non_blocking=True)
@@ -858,6 +881,10 @@ class MainController():
             self.on_pause()
             self.on_slider_update()
             self.gui.process_events()
+            if _auto_paused:
+                from PySide6.QtWidgets import QApplication
+                self.gui.text('Auto-paused propagation.')
+                QApplication.beep()
 
     def on_propagate_forward_one(self, steps=1):
         if self.propagating or self.curr_ti >= self.T - 1:
