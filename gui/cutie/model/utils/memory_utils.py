@@ -19,6 +19,15 @@ _MAX_TRITON_TOPK = 64
 
 if _TRITON_AVAILABLE:
 
+    _AFFINITY_TRITON_CONFIGS = [
+        triton.Config({'BLOCK_N': 128, 'BLOCK_HW': 8, 'BLOCK_CK': 32}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_HW': 16, 'BLOCK_CK': 32}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_HW': 32, 'BLOCK_CK': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_HW': 8, 'BLOCK_CK': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_HW': 16, 'BLOCK_CK': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_HW': 32, 'BLOCK_CK': 64}, num_warps=8, num_stages=3),
+    ]
+
     @triton.jit
     def _select_topk_rows(
         values,
@@ -27,25 +36,23 @@ if _TRITON_AVAILABLE:
         CANDIDATES: tl.constexpr,
         TOPK_PAD: tl.constexpr,
     ):
-        candidate_offsets = tl.arange(0, CANDIDATES)[None, :]
-        rank_offsets = tl.arange(0, TOPK_PAD)[None, :]
+        # Encode each score together with its token id so Triton's bitonic top-k
+        # can select both in one pass along the minor dimension.
+        low_mask = 0xFFFFFFFF
+        value_bits = values.to(tl.int32, bitcast=True)
+        ordered_bits = value_bits ^ ((value_bits >> 31) & 0x7FFFFFFF)
+        tie_break = low_mask - indices.to(tl.int64)
+        packed = (ordered_bits.to(tl.int64) << 32) | tie_break
+        top_packed = tl.topk(packed, k=TOPK_PAD, dim=1)
 
-        out_values = tl.full((BLOCK_ROWS, TOPK_PAD), -float("inf"), tl.float32)
-        out_indices = tl.zeros((BLOCK_ROWS, TOPK_PAD), tl.int32)
-        work_values = values
-
-        for rank in tl.static_range(TOPK_PAD):
-            max_values, max_positions = tl.max(work_values, axis=1, return_indices=True)
-            pos_mask = candidate_offsets == max_positions[:, None]
-            selected_indices = tl.max(tl.where(pos_mask, indices, 0), axis=1)
-            rank_mask = rank_offsets == rank
-            out_values = tl.where(rank_mask, max_values[:, None], out_values)
-            out_indices = tl.where(rank_mask, selected_indices[:, None], out_indices)
-            work_values = tl.where(pos_mask, -float("inf"), work_values)
-
+        top_ordered_bits = (top_packed >> 32).to(tl.int32)
+        restored_bits = top_ordered_bits ^ ((top_ordered_bits >> 31) & 0x7FFFFFFF)
+        out_values = restored_bits.to(tl.float32, bitcast=True)
+        out_indices = (low_mask - (top_packed & low_mask)).to(tl.int32)
         return out_values, out_indices
 
 
+    @triton.autotune(configs=_AFFINITY_TRITON_CONFIGS, key=["hw", "ck"])
     @triton.jit
     def _sparse_topk_affinity_qe_kernel(
         mk_ptr,
@@ -164,23 +171,24 @@ if _TRITON_AVAILABLE:
         tl.store(
             values_ptr
             + pid_b * stride_out_b
+            + hw_offsets[:, None] * stride_out_hw
             + pid_block * stride_out_block
-            + rank_offsets[:, None] * stride_out_k
-            + hw_offsets[None, :] * stride_out_hw,
-            tl.trans(local_values),
-            mask=hw_mask[None, :],
+            + rank_offsets[None, :] * stride_out_k,
+            local_values,
+            mask=hw_mask[:, None],
         )
         tl.store(
             indices_ptr
             + pid_b * stride_idx_b
+            + hw_offsets[:, None] * stride_idx_hw
             + pid_block * stride_idx_block
-            + rank_offsets[:, None] * stride_idx_k
-            + hw_offsets[None, :] * stride_idx_hw,
-            tl.trans(local_indices),
-            mask=hw_mask[None, :],
+            + rank_offsets[None, :] * stride_idx_k,
+            local_indices,
+            mask=hw_mask[:, None],
         )
 
 
+    @triton.autotune(configs=_AFFINITY_TRITON_CONFIGS, key=["hw", "ck"])
     @triton.jit
     def _sparse_topk_affinity_no_qe_kernel(
         mk_ptr,
@@ -277,20 +285,20 @@ if _TRITON_AVAILABLE:
         tl.store(
             values_ptr
             + pid_b * stride_out_b
+            + hw_offsets[:, None] * stride_out_hw
             + pid_block * stride_out_block
-            + rank_offsets[:, None] * stride_out_k
-            + hw_offsets[None, :] * stride_out_hw,
-            tl.trans(local_values),
-            mask=hw_mask[None, :],
+            + rank_offsets[None, :] * stride_out_k,
+            local_values,
+            mask=hw_mask[:, None],
         )
         tl.store(
             indices_ptr
             + pid_b * stride_idx_b
+            + hw_offsets[:, None] * stride_idx_hw
             + pid_block * stride_idx_block
-            + rank_offsets[:, None] * stride_idx_k
-            + hw_offsets[None, :] * stride_idx_hw,
-            tl.trans(local_indices),
-            mask=hw_mask[None, :],
+            + rank_offsets[None, :] * stride_idx_k,
+            local_indices,
+            mask=hw_mask[:, None],
         )
 
 
@@ -375,6 +383,12 @@ def _choose_triton_topk_pad(top_k: int) -> Optional[int]:
     if topk_pad > _MAX_TRITON_TOPK:
         return None
     return topk_pad
+
+
+def _choose_triton_candidate_dtype(tensor: torch.Tensor) -> torch.dtype:
+    if tensor.dtype in (torch.float16, torch.bfloat16):
+        return tensor.dtype
+    return torch.float32
 
 
 # @torch.jit.script
@@ -618,14 +632,15 @@ def _triton_topk_affinity(
     if topk_pad is None:
         return _chunked_topk_softmax_sparse(mk, ms, qk, qe, top_k, return_usage=return_usage)
 
-    block_hw = 16
     block_n = 128
-    block_ck = 32
     num_blocks = triton.cdiv(num_tokens, block_n)
     scale = 1.0 / math.sqrt(ck)
-    block_values = torch.empty((bs, num_blocks, topk_pad, hw), device=mk.device, dtype=torch.float32)
-    block_indices = torch.empty((bs, num_blocks, topk_pad, hw), device=mk.device, dtype=torch.int32)
-    grid = (triton.cdiv(hw, block_hw), num_blocks, bs)
+    candidate_dtype = _choose_triton_candidate_dtype(mk)
+    block_values = torch.empty((bs, hw, num_blocks, topk_pad),
+                               device=mk.device,
+                               dtype=candidate_dtype)
+    block_indices = torch.empty((bs, hw, num_blocks, topk_pad), device=mk.device, dtype=torch.int32)
+    grid = lambda meta: (triton.cdiv(hw, meta["BLOCK_HW"]), num_blocks, bs)
 
     if qe is not None:
         qk_weighted = (qk * qe).contiguous()
@@ -652,23 +667,19 @@ def _triton_topk_affinity(
             b_sq.stride(0),
             b_sq.stride(1),
             block_values.stride(0),
-            block_values.stride(1),
             block_values.stride(2),
             block_values.stride(3),
+            block_values.stride(1),
             block_indices.stride(0),
-            block_indices.stride(1),
             block_indices.stride(2),
             block_indices.stride(3),
+            block_indices.stride(1),
             num_tokens,
             hw,
             ck,
             scale,
             HAS_MS=ms is not None,
-            BLOCK_N=block_n,
-            BLOCK_HW=block_hw,
-            BLOCK_CK=block_ck,
             TOPK_PAD=topk_pad,
-            num_warps=4,
         )
     else:
         _sparse_topk_affinity_no_qe_kernel[grid](
@@ -686,30 +697,28 @@ def _triton_topk_affinity(
             qk.stride(1),
             qk.stride(2),
             block_values.stride(0),
-            block_values.stride(1),
             block_values.stride(2),
             block_values.stride(3),
+            block_values.stride(1),
             block_indices.stride(0),
-            block_indices.stride(1),
             block_indices.stride(2),
             block_indices.stride(3),
+            block_indices.stride(1),
             num_tokens,
             hw,
             ck,
             scale,
             HAS_MS=ms is not None,
-            BLOCK_N=block_n,
-            BLOCK_HW=block_hw,
-            BLOCK_CK=block_ck,
             TOPK_PAD=topk_pad,
-            num_warps=4,
         )
 
-    candidate_values = block_values.reshape(bs, num_blocks * topk_pad, hw)
-    candidate_indices = block_indices.reshape(bs, num_blocks * topk_pad, hw).to(torch.long)
-    topk_values, order = torch.topk(candidate_values, k=top_k, dim=1)
-    indices = candidate_indices.gather(1, order)
+    candidate_values = block_values.reshape(bs, hw, num_blocks * topk_pad)
+    candidate_indices = block_indices.reshape(bs, hw, num_blocks * topk_pad).to(torch.long)
+    topk_values_hw, order = torch.topk(candidate_values, k=top_k, dim=2)
+    indices_hw = candidate_indices.gather(2, order)
 
+    topk_values = topk_values_hw.transpose(1, 2).contiguous().float()
+    indices = indices_hw.transpose(1, 2).contiguous()
     maxes = topk_values.max(dim=1, keepdim=True).values
     weights = torch.exp(topk_values - maxes)
     weights /= torch.sum(weights, dim=1, keepdim=True)
