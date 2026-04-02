@@ -12,7 +12,7 @@ from gui.cutie.model.channel_attn import CAResBlock
 def _split_heads(x: torch.Tensor, num_heads: int) -> torch.Tensor:
     batch_size, seq_len, dim = x.shape
     head_dim = dim // num_heads
-    return x.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
+    return x.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
 
 
 def _project_qkv(mha: nn.MultiheadAttention,

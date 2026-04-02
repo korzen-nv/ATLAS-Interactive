@@ -137,6 +137,14 @@ class InferenceCore:
         self.profiler.enabled = cfg.get('profile', False)
         self.last_mask = None
 
+    def _resolve_trt_mask_decoder(self, num_objects: int):
+        trt_mask_decoder = self.trt_mask_decoder
+        if trt_mask_decoder is None:
+            return None
+        if hasattr(trt_mask_decoder, 'get'):
+            return trt_mask_decoder.get(num_objects)
+        return trt_mask_decoder
+
     def clear_memory(self):
         self.curr_ti = -1
         self.last_mem_ti = 0
@@ -189,21 +197,28 @@ class InferenceCore:
             as_permanent = 'first'
 
         self.memory.initialize_sensory_if_needed(key, self.object_manager.all_obj_ids)
-        msk_value, sensory, obj_value, _ = self.network.encode_mask(
-            image,
-            pix_feat,
-            self.memory.get_sensory(self.object_manager.all_obj_ids),
-            prob,
-            deep_update=is_deep_update,
-            chunk_size=self.chunk_size,
-            need_weights=self.save_aux)
-        self.memory.add_memory(key,
-                               shrinkage,
-                               msk_value,
-                               obj_value,
-                               self.object_manager.all_obj_ids,
-                               selection=selection,
-                               as_permanent=as_permanent)
+        if (self.trt_mask_decoder is not None
+                and hasattr(self.trt_mask_decoder, 'warmup')
+                and not self.flip_aug):
+            self.trt_mask_decoder.warmup(len(self.object_manager.all_obj_ids))
+        with self.profiler.section('encode_mask'):
+            msk_value, sensory, obj_value, _ = self.network.encode_mask(
+                image,
+                pix_feat,
+                self.memory.get_sensory(self.object_manager.all_obj_ids),
+                prob,
+                deep_update=is_deep_update,
+                chunk_size=self.chunk_size,
+                need_weights=self.save_aux,
+                profiler=self.profiler)
+        with self.profiler.section('memory_store'):
+            self.memory.add_memory(key,
+                                   shrinkage,
+                                   msk_value,
+                                   obj_value,
+                                   self.object_manager.all_obj_ids,
+                                   selection=selection,
+                                   as_permanent=as_permanent)
         self.last_mem_ti = self.curr_ti
         if is_deep_update:
             self.memory.update_sensory(sensory, self.object_manager.all_obj_ids)
@@ -254,24 +269,28 @@ class InferenceCore:
             pix_feat, key, selection, self.last_mask, self.network,
             readout_fn=readout_fn,
             profiler=self.profiler)
-        memory_readout = self.object_manager.realize_dict(memory_readout)
+        with self.profiler.section('memory_realize'):
+            memory_readout = self.object_manager.realize_dict(memory_readout)
         self.profiler.mark('mask_decode')
         current_sensory = self.memory.get_sensory(self.object_manager.all_obj_ids)
-        if (self.trt_mask_decoder is not None
+        trt_mask_decoder = self._resolve_trt_mask_decoder(memory_readout.shape[1])
+        if (trt_mask_decoder is not None
                 and not self.flip_aug and memory_readout.shape[0] == 1):
             # TRT mask decoder: run decoder + sensory update in one engine call
-            new_sensory, logits = self.trt_mask_decoder(
-                ms_features[1],   # f8
-                ms_features[2],   # f4
-                memory_readout,
-                current_sensory,
-            )
+            with self.profiler.section('trt_mask_decode'):
+                new_sensory, logits = trt_mask_decoder(
+                    ms_features[1],   # f8
+                    ms_features[2],   # f4
+                    memory_readout,
+                    current_sensory,
+                )
             # Post-processing (same as CUTIE.segment)
-            prob = torch.sigmoid(logits)
-            logits_agg = aggregate(prob, dim=1)
-            logits_agg = F.interpolate(logits_agg, scale_factor=4,
-                                       mode='bilinear', align_corners=False)
-            pred_prob_with_bg = F.softmax(logits_agg, dim=1)[0]
+            with self.profiler.section('trt_mask_postprocess'):
+                prob = torch.sigmoid(logits)
+                logits_agg = aggregate(prob, dim=1)
+                logits_agg = F.interpolate(logits_agg, scale_factor=4,
+                                           mode='bilinear', align_corners=False)
+                pred_prob_with_bg = F.softmax(logits_agg, dim=1)[0]
             if update_sensory:
                 self.memory.update_sensory(new_sensory, self.object_manager.all_obj_ids)
         else:

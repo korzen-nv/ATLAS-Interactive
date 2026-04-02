@@ -107,6 +107,19 @@ else:
     _TRT_TO_TORCH = {}
 
 
+def _execute_trt_context(context, trt_stream: torch.cuda.Stream, device: torch.device,
+                         label: str) -> None:
+    # TensorRT warns that using the default stream can trigger extra
+    # cudaStreamSynchronize calls. Launch on a private stream and bridge
+    # dependencies with stream waits so surrounding PyTorch work stays ordered.
+    caller_stream = torch.cuda.current_stream(device)
+    trt_stream.wait_stream(caller_stream)
+    ok = context.execute_async_v3(trt_stream.cuda_stream)
+    if not ok:
+        raise RuntimeError(f"{label}: execute_async_v3 failed")
+    caller_stream.wait_stream(trt_stream)
+
+
 # ---------------------------------------------------------------------------
 # TRT encoder runtime
 # ---------------------------------------------------------------------------
@@ -128,6 +141,7 @@ class TRTEncoder:
         with torch.cuda.device(self._device):
             self._engine = runtime.deserialize_cuda_engine(engine_bytes)
         self._context = self._engine.create_execution_context()
+        self._stream = torch.cuda.Stream(device=self._device)
 
         # Discover I/O tensor specs from the engine
         self._input_name: str = ""
@@ -169,11 +183,7 @@ class TRTEncoder:
         for name, tensor in outputs.items():
             self._context.set_tensor_address(name, tensor.data_ptr())
 
-        # Execute on the current CUDA stream (naturally ordered with PyTorch)
-        stream = torch.cuda.current_stream(self._device)
-        ok = self._context.execute_async_v3(stream.cuda_stream)
-        if not ok:
-            raise RuntimeError("TRTEncoder: execute_async_v3 failed")
+        _execute_trt_context(self._context, self._stream, self._device, "TRTEncoder")
 
         return tuple(outputs[name] for name in OUTPUT_NAMES)
 
@@ -490,6 +500,7 @@ class TRTMaskDecoder:
         with torch.cuda.device(self._device):
             self._engine = runtime.deserialize_cuda_engine(engine_bytes)
         self._context = self._engine.create_execution_context()
+        self._stream = torch.cuda.Stream(device=self._device)
 
         self._input_specs: dict[str, Tuple[tuple, torch.dtype]] = {}
         self._output_specs: dict[str, Tuple[tuple, torch.dtype]] = {}
@@ -548,10 +559,7 @@ class TRTMaskDecoder:
         for name, tensor in outputs.items():
             self._context.set_tensor_address(name, tensor.data_ptr())
 
-        stream = torch.cuda.current_stream(self._device)
-        ok = self._context.execute_async_v3(stream.cuda_stream)
-        if not ok:
-            raise RuntimeError("TRTMaskDecoder: execute_async_v3 failed")
+        _execute_trt_context(self._context, self._stream, self._device, "TRTMaskDecoder")
 
         new_sensory = outputs["new_sensory"]
         logits = outputs["logits"]
@@ -644,6 +652,73 @@ class TRTMaskDecoder:
         except Exception as exc:
             log.warning("TRTMaskDecoder: build failed — %s", exc)
             return None
+
+
+class TRTMaskDecoderManager:
+    """Lazily provides exact-object-count TRT mask decoders.
+
+    Keeps a fallback engine (usually the configured max object count) and
+    loads/builds smaller exact-count engines on demand. This avoids paying
+    the cost of a 19-object decoder when the active workspace only uses a
+    smaller object set.
+    """
+
+    def __init__(
+        self,
+        cutie: nn.Module,
+        input_hw: Tuple[int, int],
+        *,
+        weights_path: str = "",
+        cache_dir: Optional[str] = None,
+        fp16: bool = True,
+        device: str = "cuda",
+        fallback_num_objects: Optional[int] = None,
+    ) -> None:
+        self._cutie = cutie
+        self._input_hw = input_hw
+        self._weights_path = weights_path
+        self._cache_dir = cache_dir
+        self._fp16 = fp16
+        self._device = device
+        self._engines: dict[int, TRTMaskDecoder] = {}
+
+        if fallback_num_objects is not None:
+            fallback = self._build_engine(fallback_num_objects)
+            if fallback is not None:
+                self._engines[fallback_num_objects] = fallback
+
+    def _build_engine(self, num_objects: int) -> Optional[TRTMaskDecoder]:
+        with torch.amp.autocast(device_type=torch.device(self._device).type, enabled=False):
+            return TRTMaskDecoder.build(
+                self._cutie,
+                self._input_hw,
+                num_objects,
+                weights_path=self._weights_path,
+                cache_dir=self._cache_dir,
+                fp16=self._fp16,
+                device=self._device,
+            )
+
+    def get(self, num_objects: int) -> Optional[TRTMaskDecoder]:
+        engine = self._engines.get(num_objects)
+        if engine is not None:
+            return engine
+
+        engine = self._build_engine(num_objects)
+        if engine is not None:
+            self._engines[num_objects] = engine
+            return engine
+
+        larger = [count for count in self._engines if count >= num_objects]
+        if larger:
+            fallback_count = min(larger)
+            log.warning("TRTMaskDecoderManager: falling back to NO=%d engine for NO=%d",
+                        fallback_count, num_objects)
+            return self._engines[fallback_count]
+        return None
+
+    def warmup(self, num_objects: int) -> Optional[TRTMaskDecoder]:
+        return self.get(num_objects)
 
 
 # ===================================================================
@@ -928,6 +1003,7 @@ class TRTReadout:
         with torch.cuda.device(self._device):
             self._engine = runtime.deserialize_cuda_engine(engine_bytes)
         self._context = self._engine.create_execution_context()
+        self._stream = torch.cuda.Stream(device=self._device)
 
         self._input_specs: dict[str, Tuple[tuple, torch.dtype]] = {}
         self._output_specs: dict[str, Tuple[tuple, torch.dtype]] = {}
@@ -987,10 +1063,7 @@ class TRTReadout:
             if not self._context.set_tensor_address(name, tensor.data_ptr()):
                 raise RuntimeError(f"TRTReadout: failed to bind output '{name}'")
 
-        stream = torch.cuda.current_stream(self._device)
-        ok = self._context.execute_async_v3(stream.cuda_stream)
-        if not ok:
-            raise RuntimeError("TRTReadout: execute_async_v3 failed")
+        _execute_trt_context(self._context, self._stream, self._device, "TRTReadout")
 
         readout = outputs["readout"]
         if need_pad:
