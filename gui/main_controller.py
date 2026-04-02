@@ -824,7 +824,8 @@ class MainController():
                                                  self.curr_prob[1:],
                                                  idx_mask=False,
                                                  frame_idx=self.curr_ti)
-            self.curr_mask = torch_prob_to_numpy_mask(self.curr_prob)
+            self.curr_mask = torch_mask_to_numpy_uint8(
+                self.processor.output_prob_to_mask(self.curr_prob))
             if self.fill_gaps:
                 self.curr_mask = self.fill_mask_gaps(self.curr_mask)
             # clear
@@ -875,7 +876,8 @@ class MainController():
                     self.curr_prob = _pending_prob
 
                     with prop_prof.section('pending_mask_to_numpy'):
-                        self.curr_mask = torch_prob_to_numpy_mask(self.curr_prob)
+                        self.curr_mask = torch_mask_to_numpy_uint8(
+                            self.processor.output_prob_to_mask(self.curr_prob))
                     if self.fill_gaps:
                         with prop_prof.section('pending_fill_gaps'):
                             self.curr_mask = self.fill_mask_gaps(self.curr_mask)
@@ -1046,7 +1048,8 @@ class MainController():
                                                       frame_idx=self.curr_ti)
                 if self.crf_enabled and _crf_available():
                     self.curr_prob = _apply_crf(self.curr_image_np, self.curr_prob)
-                self.curr_mask = torch_prob_to_numpy_mask(self.curr_prob)
+                self.curr_mask = torch_mask_to_numpy_uint8(
+                    self.processor.output_prob_to_mask(self.curr_prob))
                 if self.fill_gaps:
                     self.curr_mask = self.fill_mask_gaps(self.curr_mask)
 
@@ -1770,7 +1773,8 @@ class MainController():
         self._snapshot_mask()
         self.convert_current_image_mask_torch()
         self.curr_prob = _apply_crf(self.curr_image_np, self.curr_prob)
-        self.curr_mask = torch_prob_to_numpy_mask(self.curr_prob)
+        self.curr_mask = torch_mask_to_numpy_uint8(
+            self.processor.output_prob_to_mask(self.curr_prob))
         self.save_current_mask()
         self.show_current_frame()
         self.gui.text(f'CRF applied to frame {self.curr_ti}.')

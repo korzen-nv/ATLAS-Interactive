@@ -17,8 +17,13 @@ def image_to_torch(frame: np.ndarray, device: str = 'cuda'):
 
 def torch_prob_to_numpy_mask(prob: torch.Tensor):
     mask = torch.max(prob, dim=0).indices
-    mask = mask.cpu().numpy().astype(np.uint8)
-    return mask
+    return torch_mask_to_numpy_uint8(mask)
+
+
+def torch_mask_to_numpy_uint8(mask: torch.Tensor):
+    if mask.dtype != torch.uint8:
+        mask = mask.to(dtype=torch.uint8)
+    return mask.cpu().numpy()
 
 
 def index_numpy_to_one_hot_torch(mask: np.ndarray, num_classes: int):

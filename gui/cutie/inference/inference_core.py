@@ -21,6 +21,20 @@ if TYPE_CHECKING:
 log = logging.getLogger()
 
 
+def _infer_nonempty_prob_mask_objects(mask: torch.Tensor) -> tuple[list[int], torch.Tensor]:
+    flat_mask = mask.flatten(start_dim=1)
+    active = flat_mask.amax(dim=1) > 0
+    active_indices = torch.nonzero(active, as_tuple=False).flatten()
+    if active_indices.numel() == 0:
+        objects = list(range(1, mask.shape[0] + 1))
+        return objects, mask
+
+    objects = (active_indices + 1).tolist()
+    if active_indices.numel() == mask.shape[0]:
+        return objects, mask
+    return objects, mask.index_select(0, active_indices)
+
+
 class _StepProfiler:
     """Lightweight CUDA-event profiler for InferenceCore.step().
 
@@ -339,7 +353,10 @@ class InferenceCore:
         """
         if objects is None and mask is not None:
             assert not idx_mask
-            objects = list(range(1, mask.shape[0] + 1))
+            # One-hot probability masks often include every configured object
+            # channel even when most are empty. Drop empty channels here so the
+            # internal active-object set matches the actual mask content.
+            objects, mask = _infer_nonempty_prob_mask_objects(mask)
 
         # resize input if needed -- currently only used for the GUI
         resize_needed = False
