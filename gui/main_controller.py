@@ -1936,7 +1936,7 @@ class MainController():
         if self._has_non_default_class_power():
             return torch_prob_to_numpy_mask_weighted(
                 prob, self._effective_weights(), self.class_power_mode)
-        return torch_prob_to_numpy_mask(prob)
+        return torch_mask_to_numpy_uint8(self.processor.output_prob_to_mask(prob))
 
     def on_global_power_changed(self, value: float):
         """Called by GUI when the global soft mask power slider changes."""

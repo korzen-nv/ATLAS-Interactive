@@ -35,10 +35,29 @@ class CutieBackend:
         end: bool = False,
         force_permanent: bool = False,
     ) -> torch.Tensor:
-        return self._core.step(
+        output_prob = self._core.step(
             image, mask, objects,
             idx_mask=idx_mask, end=end, force_permanent=force_permanent,
         )
+        return self._to_canonical_prob(output_prob)
+
+    def _to_canonical_prob(self, output_prob: torch.Tensor) -> torch.Tensor:
+        num_classes = self._cfg['num_objects'] + 1
+        if output_prob.shape[0] == num_classes:
+            return output_prob
+
+        height, width = output_prob.shape[-2:]
+        canonical = torch.zeros(num_classes,
+                                height,
+                                width,
+                                device=output_prob.device,
+                                dtype=output_prob.dtype)
+        if output_prob.shape[0] > 0:
+            canonical[0] = output_prob[0]
+        for tmp_id, obj in self._core.object_manager.tmp_id_to_obj.items():
+            if tmp_id < output_prob.shape[0] and 1 <= obj.id < num_classes:
+                canonical[obj.id] = output_prob[tmp_id]
+        return canonical
 
     def clear_memory(self) -> None:
         self._core.clear_memory()
@@ -56,6 +75,8 @@ class CutieBackend:
         self._core.delete_objects(objects)
 
     def output_prob_to_mask(self, output_prob: torch.Tensor) -> torch.Tensor:
+        if output_prob.shape[0] == self._cfg['num_objects'] + 1:
+            return torch.argmax(output_prob, dim=0)
         return self._core.output_prob_to_mask(output_prob)
 
     def inject_permanent_memory(self, image, mask, objects):
