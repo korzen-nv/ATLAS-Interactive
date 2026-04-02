@@ -41,6 +41,8 @@ def get_arguments():
                         help='start forward propagation automatically after the GUI opens')
     parser.add_argument('--auto-pause-after', type=float, default=None,
                         help='pause propagation after N seconds while keeping the app open')
+    parser.add_argument('--display-skip', type=int, default=None,
+                        help='set propagation preview skip count in the GUI at startup')
 
     args = parser.parse_args()
     return args

@@ -27,7 +27,7 @@ from gui.interaction import *
 from gui.interactive_utils import *
 from gui.resource_manager import ResourceManager
 from gui.gui import GUI
-from gui.reader import PropagationReader, get_data_loader
+from gui.reader import PropagationPrefetcher, PropagationReader, get_data_loader
 from gui.change_detector import detect_change_points
 from gui.exporter import convert_frames_to_video, convert_mask_to_binary
 from gui.global_memory import GlobalMemoryStore
@@ -133,8 +133,16 @@ class MainController():
         self.initialize_networks()
         self.processor = self._propagation
         self.gui = GUI(self, self.cfg)
+        display_skip = self.cfg.get('display_skip', None)
+        if display_skip is not None:
+            self.gui.display_skip_slider.setValue(int(display_skip))
         self.propagation_profiler = _PropagationWallProfiler()
         self.propagation_profiler.enabled = cfg.get('profile', False)
+        self._propagation_preview_state = None
+        self._propagation_preview_interval_s = max(
+            0.05, float(cfg.get('propagation_preview_interval_s', 0.12)))
+        self._startup_auto_pending = False
+        self._startup_auto_scheduled = False
 
         # initialize control info
         self.length: int = self.res_man.length
@@ -258,14 +266,25 @@ class MainController():
         if not self.cfg.get('auto_propagate_forward', False):
             return
 
+        self._startup_auto_pending = True
+        self._try_schedule_startup_automation()
+
+    def _try_schedule_startup_automation(self) -> None:
+        if not self._startup_auto_pending or self._startup_auto_scheduled:
+            return
+        if self.res_man.preload and not self.res_man._preload_finished:
+            return
+
         from PySide6.QtCore import QTimer
 
+        self._startup_auto_scheduled = True
         QTimer.singleShot(750, self._auto_start_forward_propagation)
 
     def _auto_start_forward_propagation(self) -> None:
         if not self.initialized or self.propagating:
             return
 
+        self._startup_auto_pending = False
         self.gui.text('Auto-starting forward propagation.')
         self.on_forward_propagation()
 
@@ -277,8 +296,56 @@ class MainController():
             self.gui.progressbar.setValue(100)
             gb = self.res_man._estimate_cache_gb()
             self.gui.text(f'Preload complete: {self.res_man.length} frames cached ({gb:.1f} GB)')
+            self._try_schedule_startup_automation()
             from PySide6.QtCore import QTimer
             QTimer.singleShot(3000, lambda: self.gui.progressbar.setValue(0))
+
+    def _upload_propagation_frame(self, frame_tensor: torch.Tensor) -> torch.Tensor:
+        if frame_tensor.device.type == 'cuda':
+            return frame_tensor
+
+        if frame_tensor.ndim == 3 and frame_tensor.shape[0] == 3 and frame_tensor.dtype.is_floating_point:
+            return frame_tensor.to(self.device, non_blocking=True)
+
+        frame_tensor = frame_tensor.to(self.device, non_blocking=True)
+        if frame_tensor.ndim == 3 and frame_tensor.shape[0] != 3:
+            frame_tensor = frame_tensor.permute(2, 0, 1).contiguous()
+        elif not frame_tensor.is_contiguous():
+            frame_tensor = frame_tensor.contiguous()
+
+        if frame_tensor.dtype == torch.uint8:
+            frame_tensor = frame_tensor.to(dtype=torch.float32)
+            frame_tensor.mul_(1.0 / 255.0)
+        elif frame_tensor.dtype != torch.float32:
+            frame_tensor = frame_tensor.to(dtype=torch.float32)
+        return frame_tensor
+
+    def _queue_propagation_preview(self,
+                                   ti: int,
+                                   image_np: np.ndarray,
+                                   image_torch: torch.Tensor,
+                                   prob: torch.Tensor,
+                                   mask: np.ndarray) -> None:
+        # Latest-only preview: keep only the newest propagated frame.
+        self._propagation_preview_state = (ti, image_np, image_torch, prob, mask)
+
+    def _flush_propagation_preview(self) -> bool:
+        if self._propagation_preview_state is None:
+            return False
+
+        ti, image_np, image_torch, prob, mask = self._propagation_preview_state
+        self.curr_ti = ti
+        self.curr_image_np = image_np
+        self.curr_image_torch = image_torch
+        self.curr_prob = prob
+        self.curr_mask = mask
+        self.gui.update_slider(self.curr_ti)
+        if self.curr_image_torch is not None and self.curr_prob is not None:
+            self.show_current_frame(fast=True)
+        else:
+            self.show_current_frame(fast=False)
+        self._propagation_preview_state = None
+        return True
 
     def initialize_networks(self) -> None:
         # TorchRT: compiled resize ops for fixed resolution pairs (720 / 1080)
@@ -828,7 +895,12 @@ class MainController():
             self.gui.tl_slider.setEnabled(False)
 
             dataset = PropagationReader(self.res_man, self.curr_ti, self.propagate_direction)
-            loader = get_data_loader(dataset, self.cfg.num_read_workers)
+            use_direct_prefetch = self.res_man.preload and self.res_man._preload_finished
+            if use_direct_prefetch:
+                loader_iter = iter(PropagationPrefetcher(dataset, self.device))
+            else:
+                loader = get_data_loader(dataset, self.cfg.num_read_workers)
+                loader_iter = iter(loader)
 
             # uncertainty: batched after propagation
             _prop_tis = []
@@ -838,6 +910,7 @@ class MainController():
             import time
             _THROTTLE_N = max(1, self.gui.display_skip_slider.value())
             _prop_t0 = time.perf_counter()
+            _last_ui_pump = _prop_t0
             _auto_pause_after = self.cfg.get('auto_pause_after', None)
             _auto_paused = False
             _prop_frames = 0
@@ -848,9 +921,9 @@ class MainController():
             _pending_image_np = None
             _pending_image_torch = None
 
-            def _process_pending():
+            def _process_pending(force_preview: bool = False):
                 """Process the previous frame's results (runs while GPU computes next frame)."""
-                nonlocal _prop_frames
+                nonlocal _prop_frames, _last_ui_pump
                 with prop_prof.section('pending_total'):
                     self.curr_ti = _pending_ti
                     self.curr_image_np = _pending_image_np
@@ -868,20 +941,26 @@ class MainController():
                     _prop_tis.append(self.curr_ti)
                     _prop_frames += 1
 
-                    if _prop_frames % _THROTTLE_N == 0:
+                    if force_preview or (_prop_frames % _THROTTLE_N == 0):
+                        self._queue_propagation_preview(self.curr_ti,
+                                                        self.curr_image_np,
+                                                        self.curr_image_torch,
+                                                        self.curr_prob,
+                                                        self.curr_mask)
+
+                    now = time.perf_counter()
+                    if (now - _last_ui_pump) >= self._propagation_preview_interval_s:
                         with prop_prof.section('pending_display_frame'):
-                            self.show_current_frame(fast=True)
-                        with prop_prof.section('pending_update_memory_gauges'):
-                            self.update_memory_gauges()
+                            displayed = self._flush_propagation_preview()
+                        if displayed:
+                            with prop_prof.section('pending_update_memory_gauges'):
+                                self.update_memory_gauges()
                         with prop_prof.section('pending_process_events'):
                             self.gui.process_events()
-                    else:
-                        with prop_prof.section('pending_update_slider'):
-                            self.gui.update_slider(self.curr_ti)
+                        _last_ui_pump = now
 
                 prop_prof.finish_frame()
 
-            loader_iter = iter(loader)
             while True:
                 if not self.propagating:
                     break
@@ -893,12 +972,18 @@ class MainController():
 
                 _loader_t0 = time.perf_counter()
                 try:
-                    curr_image_np, curr_image_torch = next(loader_iter)
+                    if use_direct_prefetch:
+                        curr_image_np, curr_image_torch, ready_event = next(loader_iter)
+                    else:
+                        curr_image_np, curr_image_torch = next(loader_iter)
+                        ready_event = None
                 except StopIteration:
                     break
                 prop_prof.add('loader_wait', time.perf_counter() - _loader_t0)
                 with prop_prof.section('frame_upload'):
-                    curr_image_torch = curr_image_torch.to(self.device, non_blocking=True)
+                    if ready_event is not None:
+                        torch.cuda.current_stream().wait_event(ready_event)
+                    curr_image_torch = self._upload_propagation_frame(curr_image_torch)
                 with prop_prof.section('advance_frame'):
                     self.propagate_fn()
                 curr_ti = self.curr_ti
@@ -929,7 +1014,16 @@ class MainController():
 
             # Process the last pending frame
             if _pending_prob is not None:
-                _process_pending()
+                _process_pending(force_preview=True)
+
+            if self._propagation_preview_state is not None:
+                with prop_prof.section('pending_display_frame'):
+                    displayed = self._flush_propagation_preview()
+                if displayed:
+                    with prop_prof.section('pending_update_memory_gauges'):
+                        self.update_memory_gauges()
+            with prop_prof.section('pending_process_events'):
+                self.gui.process_events()
 
             prop_prof.flush()
 

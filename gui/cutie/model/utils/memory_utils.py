@@ -756,11 +756,13 @@ def sparse_topk_affinity(
 
 
 def _prepare_token_major_values(
-    v: torch.Tensor,
+    v: Optional[torch.Tensor],
     v_token_major: Optional[torch.Tensor],
 ) -> tuple[torch.Tensor, bool, Optional[tuple[int, int]]]:
-    multi_obj = v.dim() == 4
     if v_token_major is None:
+        if v is None:
+            raise ValueError("sparse_readout requires either v or v_token_major")
+        multi_obj = v.dim() == 4
         if multi_obj:
             bs, num_objects, cv, _ = v.shape
             value_tm = v.permute(0, 3, 1, 2).reshape(bs, v.shape[-1], num_objects * cv).contiguous()
@@ -800,7 +802,7 @@ def _sparse_readout_pytorch(
 
 
 def _triton_sparse_readout(
-    v: torch.Tensor,
+    v: Optional[torch.Tensor],
     topk_indices: torch.Tensor,
     topk_weights: torch.Tensor,
     v_token_major: Optional[torch.Tensor],
@@ -850,7 +852,7 @@ def _triton_sparse_readout(
 
 
 def sparse_readout(
-        v: torch.Tensor,
+        v: Optional[torch.Tensor],
         topk_indices: torch.Tensor,
         topk_weights: torch.Tensor,
         *,
@@ -860,7 +862,8 @@ def sparse_readout(
     """Memory readout using sparse top-k affinity (gather instead of dense BMM).
 
     Args:
-        v: (bs, C, N) or (bs, num_objects, C, N) — memory values
+        v: (bs, C, N) or (bs, num_objects, C, N) — memory values. Can be ``None``
+            when ``v_token_major`` is provided and the Triton backend is used.
         topk_indices: (bs, top_k, HW) — indices into N dimension
         topk_weights: (bs, top_k, HW) — normalised weights
         backend: auto | pytorch | triton
@@ -873,6 +876,8 @@ def sparse_readout(
     resolved = _resolve_sparse_backend(backend, topk_weights)
     if resolved == "triton" and topk_weights.is_cuda and _TRITON_AVAILABLE:
         return _triton_sparse_readout(v, topk_indices, topk_weights, v_token_major)
+    if v is None:
+        raise ValueError("sparse_readout requires v for non-Triton backends")
     return _sparse_readout_pytorch(v, topk_indices, topk_weights)
 
 

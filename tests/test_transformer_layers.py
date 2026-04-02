@@ -4,7 +4,7 @@ import torch
 from omegaconf import OmegaConf
 
 from gui.cutie.model.transformer.object_transformer import QueryTransformer
-from gui.cutie.model.transformer.transformer_layers import CrossAttention, SelfAttention
+from gui.cutie.model.transformer.transformer_layers import CrossAttention, PixelFFN, SelfAttention
 
 
 class TransformerLayersTest(unittest.TestCase):
@@ -43,6 +43,21 @@ class TransformerLayersTest(unittest.TestCase):
 
         torch.testing.assert_close(fast, slow, atol=1e-6, rtol=1e-5)
         self.assertEqual(weights.shape, (2, 2, 3, 6))
+
+    def test_pixel_ffn_matches_legacy_contiguous_layout_path(self) -> None:
+        torch.manual_seed(2)
+        module = PixelFFN(8)
+        module.eval()
+
+        pixel = torch.randn(2, 3, 8, 4, 5)
+        pixel_flat = torch.randn(6, 20, 8)
+
+        legacy = pixel_flat.view(6, 4, 5, 8).permute(0, 3, 1, 2).contiguous()
+        expected = module.conv(legacy).reshape(2, 3, 8, 4, 5)
+
+        actual = module(pixel, pixel_flat)
+
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
 
     def test_object_transformer_aux_mask_flattens_object_dimension(self) -> None:
         cfg = OmegaConf.create({

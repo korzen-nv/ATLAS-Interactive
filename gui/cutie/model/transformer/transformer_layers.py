@@ -271,10 +271,10 @@ class PixelFFN(nn.Module):
         # pixel_flat: (batch_size*num_objects) * (H*W) * dim
         bs, num_objects, _, h, w = pixel.shape
         pixel_flat = pixel_flat.view(bs * num_objects, h, w, self.dim)
-        pixel_flat = pixel_flat.permute(0, 3, 1, 2).contiguous()
+        pixel_flat = pixel_flat.permute(0, 3, 1, 2)
 
         x = self.conv(pixel_flat)
-        x = x.view(bs, num_objects, self.dim, h, w)
+        x = x.reshape(bs, num_objects, self.dim, h, w)
         return x
 
 

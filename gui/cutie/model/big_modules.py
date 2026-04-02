@@ -157,7 +157,8 @@ class MaskEncoder(nn.Module):
             else:
                 g_chunk = g[:, i:i + chunk_size]
             actual_chunk_size = g_chunk.shape[1]
-            g_chunk = g_chunk.flatten(start_dim=0, end_dim=1)
+            g_chunk = g_chunk.flatten(start_dim=0, end_dim=1).contiguous(
+                memory_format=torch.channels_last)
 
             g_chunk = self.conv1(g_chunk)
             g_chunk = self.bn1(g_chunk)  # 1/2, 64
@@ -168,7 +169,7 @@ class MaskEncoder(nn.Module):
             g_chunk = self.layer2(g_chunk)  # 1/8
             g_chunk = self.layer3(g_chunk)  # 1/16
 
-            g_chunk = g_chunk.view(batch_size, actual_chunk_size, *g_chunk.shape[1:])
+            g_chunk = g_chunk.reshape(batch_size, actual_chunk_size, *g_chunk.shape[1:])
             g_chunk = self.fuser(pix_feat, g_chunk)
             all_g.append(g_chunk)
             if deep_update:
