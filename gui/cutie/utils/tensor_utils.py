@@ -43,6 +43,22 @@ def unpad(img: torch.Tensor, pad: Iterable[int]) -> torch.Tensor:
     return img
 
 
+def downsample_to_size(x: torch.Tensor, size: Iterable[int]) -> torch.Tensor:
+    target_h, target_w = size
+    src_h, src_w = x.shape[-2:]
+
+    if src_h == target_h and src_w == target_w:
+        return x
+
+    if src_h % target_h == 0 and src_w % target_w == 0:
+        stride_h = src_h // target_h
+        stride_w = src_w // target_w
+        if stride_h == stride_w:
+            return F.avg_pool2d(x, stride_h, stride_h)
+
+    return F.interpolate(x, size=(target_h, target_w), mode='area')
+
+
 # @torch.jit.script
 def aggregate(prob: torch.Tensor, dim: int) -> torch.Tensor:
     with torch.cuda.amp.autocast(enabled=False):

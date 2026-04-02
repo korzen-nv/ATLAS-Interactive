@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from gui.cutie.model.transformer.positional_encoding import PositionalEncoding
+from gui.cutie.utils.tensor_utils import downsample_to_size
 
 
 # @torch.jit.script
@@ -60,7 +61,7 @@ class ObjectSummarizer(nn.Module):
         # value: B*num_objects*value_dim*H*W
         # -> B*num_objects*H*W*value_dim
         h, w = value.shape[-2:]
-        masks = F.interpolate(masks, size=(h, w), mode='area')
+        masks = downsample_to_size(masks, (h, w))
         masks = masks.unsqueeze(-1)
         inv_masks = 1 - masks
         repeated_masks = torch.cat([

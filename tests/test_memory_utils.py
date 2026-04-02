@@ -125,6 +125,27 @@ class SparseReadoutTest(unittest.TestCase):
 
         torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton path")
+    def test_triton_sparse_readout_accepts_token_major_only(self) -> None:
+        torch.manual_seed(5)
+        value = torch.randn(1, 3, 5, 17, device='cuda', dtype=torch.float16)
+        topk_indices = torch.randint(0, 17, (1, 4, 9), device='cuda')
+        topk_weights = torch.softmax(torch.randn(1, 4, 9, device='cuda'), dim=1)
+        value_token_major = value.permute(0, 1, 3, 2).contiguous()
+
+        expected = sparse_readout(value,
+                                  topk_indices,
+                                  topk_weights,
+                                  backend='triton',
+                                  v_token_major=value_token_major)
+        actual = sparse_readout(None,
+                                topk_indices,
+                                topk_weights,
+                                backend='triton',
+                                v_token_major=value_token_major)
+
+        torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
 
 if __name__ == '__main__':
     unittest.main()

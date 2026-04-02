@@ -8,6 +8,7 @@ from gui.cutie.inference.object_manager import ObjectManager
 from gui.cutie.inference.kv_memory_store import KeyValueMemoryStore
 from gui.cutie.model.cutie import CUTIE
 from gui.cutie.model.utils.memory_utils import *
+from gui.cutie.model.utils.memory_utils import _resolve_sparse_backend
 
 log = logging.getLogger()
 
@@ -212,8 +213,14 @@ class MemoryManager:
             for objects in object_chunks:
                 this_sensory = self._get_sensory_by_ids(objects)
                 this_last_mask = self._get_mask_by_ids(last_mask, objects)
-                this_msk_value = self._get_visual_values_by_ids(objects)  # (1/2)*num_objects*C*N
-                this_msk_value_t = self._get_visual_values_token_major_by_ids(objects)
+                resolved_readout_backend = _resolve_sparse_backend(self.readout_backend,
+                                                                   topk_weights)
+                if resolved_readout_backend == 'triton':
+                    this_msk_value = None
+                    this_msk_value_t = self._get_visual_values_token_major_by_ids(objects)
+                else:
+                    this_msk_value = self._get_visual_values_by_ids(objects)
+                    this_msk_value_t = None
                 with section('sparse_readout'):
                     visual_readout = sparse_readout(
                         this_msk_value,

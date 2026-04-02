@@ -10,7 +10,7 @@ from gui.cutie.model.aux_modules import AuxComputer
 from gui.cutie.model.utils.memory_utils import *
 from gui.cutie.model.transformer.object_transformer import QueryTransformer
 from gui.cutie.model.transformer.object_summarizer import ObjectSummarizer
-from gui.cutie.utils.tensor_utils import aggregate
+from gui.cutie.utils.tensor_utils import aggregate, downsample_to_size
 
 log = logging.getLogger()
 
@@ -146,7 +146,7 @@ class CUTIE(nn.Module):
                      last_mask: torch.Tensor,
                      *,
                      chunk_size: int = -1) -> torch.Tensor:
-        last_mask = F.interpolate(last_mask, size=sensory.shape[-2:], mode='area')
+        last_mask = downsample_to_size(last_mask, sensory.shape[-2:])
         last_others = self._get_others(last_mask)
         fused = self.pixel_fuser(pix_feat,
                                  pixel,
