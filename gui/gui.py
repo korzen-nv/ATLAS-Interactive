@@ -100,13 +100,13 @@ class MarkerSlider(QSlider):
         super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        # always let QSlider finish its drag state first
+        super().mouseReleaseEvent(event)
         # if clicking on a marker (permanent or change), jump to that frame
         if event.button() == Qt.MouseButton.LeftButton and (self._markers or self._change_markers or self._uncertainty_markers):
             clicked = self._x_to_nearest_marker(event.position().x())
             if clicked is not None:
                 self.setValue(clicked)
-                return
-        super().mouseReleaseEvent(event)
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -574,6 +574,8 @@ class GUI(QWidget):
                     self).activated.connect(controller.on_clear_change_markers)
         QShortcut(QKeySequence(Qt.Key.Key_V), self).activated.connect(
             controller.on_toggle_change_heatmap)
+        QShortcut(QKeySequence(Qt.Key.Key_M), self).activated.connect(
+            controller.on_toggle_mask_diff)
 
         # save to global memory
         QShortcut(QKeySequence(Qt.Key.Key_G),

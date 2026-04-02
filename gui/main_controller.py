@@ -108,6 +108,7 @@ class MainController():
         self._detecting_changes: bool = False
         self._change_heatmaps: dict[int, np.ndarray] = {}
         self._show_change_heatmap: bool = False
+        self._show_mask_diff: bool = False
 
         # uncertainty markers (computed during propagation)
         self.uncertainty_markers: set[int] = set()
@@ -496,6 +497,8 @@ class MainController():
                                            self.overlay_layer, self.vis_target_objects)
         if self._show_change_heatmap and self.curr_ti in self._change_heatmaps:
             self.vis_image = self._apply_change_heatmap(self.vis_image)
+        if self._show_mask_diff:
+            self.vis_image = self._apply_mask_diff(self.vis_image)
 
     def _apply_change_heatmap(self, image: np.ndarray) -> np.ndarray:
         dist_map = self._change_heatmaps[self.curr_ti]  # (16, 16) float
@@ -532,6 +535,8 @@ class MainController():
             self.res_man.save_visualization(self.curr_ti, self.vis_mode, self.vis_image)
         if self.save_soft_mask and not invalid_soft_mask:
             self.res_man.save_soft_mask(self.curr_ti, self.curr_prob.cpu().numpy())
+        if self._show_mask_diff:
+            self.vis_image = self._apply_mask_diff(self.vis_image)
         self.gui.set_canvas(self.vis_image)
 
     def show_current_frame(self, fast: bool = False, invalid_soft_mask: bool = False):
@@ -1057,6 +1062,25 @@ class MainController():
         self.show_current_frame()
         state = 'ON' if self._show_change_heatmap else 'OFF'
         self.gui.text(f'Change heatmap {state}')
+
+    def on_toggle_mask_diff(self):
+        self._show_mask_diff = not self._show_mask_diff
+        self.show_current_frame()
+        state = 'ON' if self._show_mask_diff else 'OFF'
+        self.gui.text(f'Mask diff overlay {state} (green=added, red=removed, yellow=class changed)')
+
+    def _apply_mask_diff(self, image: np.ndarray) -> np.ndarray:
+        """Overlay mask diff between current frame and its neighbor."""
+        # determine neighbor: previous frame for forward context, next for backward
+        neighbor_ti = self.curr_ti - 1
+        if neighbor_ti < 0:
+            neighbor_ti = self.curr_ti + 1
+        if neighbor_ti < 0 or neighbor_ti >= self.T:
+            return image
+        neighbor_mask = self.res_man.get_mask(neighbor_ti)
+        if neighbor_mask is None:
+            return image
+        return overlay_mask_diff(image, neighbor_mask, self.curr_mask)
 
     def on_change_sensitivity_update(self):
         if not hasattr(self, 'initialized') or not self.initialized:

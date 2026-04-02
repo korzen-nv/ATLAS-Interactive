@@ -107,6 +107,45 @@ def get_visualization_torch(mode: Literal['image', 'mask', 'fade', 'davis', 'lig
         raise NotImplementedError
 
 
+def overlay_mask_diff(image: np.ndarray, prev_mask: np.ndarray, curr_mask: np.ndarray,
+                      alpha: float = 0.5) -> np.ndarray:
+    """Overlay showing how masks changed between two frames.
+
+    Args:
+        image: (H, W, 3) uint8 RGB image (current frame visualization).
+        prev_mask: (H, W) uint8 mask from the neighboring frame.
+        curr_mask: (H, W) uint8 mask from the current frame.
+        alpha: Blending strength of the diff overlay.
+
+    Returns:
+        (H, W, 3) uint8 composited image with colored diff overlay.
+        Green = added, Red = removed, Yellow = class changed.
+    """
+    prev_fg = prev_mask > 0
+    curr_fg = curr_mask > 0
+
+    added = ~prev_fg & curr_fg          # new mask pixels
+    removed = prev_fg & ~curr_fg        # lost mask pixels
+    changed = prev_fg & curr_fg & (prev_mask != curr_mask)  # class swap
+
+    overlay = np.zeros_like(image, dtype=np.float32)
+    blend = np.zeros(image.shape[:2], dtype=np.float32)
+
+    # green for added
+    overlay[added] = [0, 255, 0]
+    blend[added] = alpha
+    # red for removed
+    overlay[removed] = [255, 0, 0]
+    blend[removed] = alpha
+    # yellow for class changed
+    overlay[changed] = [255, 255, 0]
+    blend[changed] = alpha
+
+    blend = blend[:, :, np.newaxis]
+    result = image * (1 - blend) + overlay * blend
+    return result.clip(0, 255).astype(np.uint8)
+
+
 def overlay_change_heatmap(image: np.ndarray, heatmap: np.ndarray,
                            alpha: float = 0.5) -> np.ndarray:
     """Blend a spatial change heatmap onto an RGB image.
