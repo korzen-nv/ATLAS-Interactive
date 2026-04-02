@@ -91,6 +91,30 @@ class SparseTopkAffinityTest(unittest.TestCase):
         torch.testing.assert_close(cand_dense, ref_dense, atol=2e-4, rtol=2e-4)
         torch.testing.assert_close(candidate[2], reference[2], atol=2e-4, rtol=2e-4)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton path")
+    def test_triton_affinity_matches_dense_when_topk_is_power_of_two(self) -> None:
+        torch.manual_seed(6)
+        mk = torch.randn(1, 8, 61, device='cuda', dtype=torch.float16)
+        ms = torch.rand(1, 1, 61, device='cuda', dtype=torch.float16) + 1.0
+        qk = torch.randn(1, 8, 19, device='cuda', dtype=torch.float16)
+        qe = torch.sigmoid(torch.randn(1, 8, 19, device='cuda', dtype=torch.float16))
+        top_k = 8
+
+        similarity = get_similarity(mk.float(), ms.float(), qk.float(), qe.float())
+        reference = do_softmax_sparse(similarity, top_k=top_k, return_usage=True)
+        candidate = sparse_topk_affinity(mk,
+                                         ms,
+                                         qk,
+                                         qe,
+                                         top_k=top_k,
+                                         return_usage=True,
+                                         backend='triton')
+
+        ref_dense = _dense_from_sparse(reference[0], reference[1], mk.shape[-1])
+        cand_dense = _dense_from_sparse(candidate[0], candidate[1], mk.shape[-1])
+        torch.testing.assert_close(cand_dense, ref_dense, atol=2e-4, rtol=2e-4)
+        torch.testing.assert_close(candidate[2], reference[2], atol=2e-4, rtol=2e-4)
+
 
 class SparseReadoutTest(unittest.TestCase):
     def test_sparse_readout_matches_dense_cpu(self) -> None:

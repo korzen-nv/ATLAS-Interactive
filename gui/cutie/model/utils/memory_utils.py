@@ -444,7 +444,7 @@ def do_softmax(
     # similarity: B x N x [HW/P]
     # use inplace with care
     if top_k is not None:
-        values, indices = torch.topk(similarity, k=top_k, dim=1)
+        values, indices = torch.topk(similarity, k=top_k, dim=1, sorted=False)
         maxes = values.max(dim=1, keepdim=True).values
         x_exp = torch.exp(values - maxes)
         x_exp /= torch.sum(x_exp, dim=1, keepdim=True)
@@ -486,7 +486,7 @@ def do_softmax_sparse(
         topk_indices: (bs, top_k, HW) — indices into N dimension
         usage (optional): (bs, N) — per-token sum of weights across HW
     """
-    values, indices = torch.topk(similarity, k=top_k, dim=1)
+    values, indices = torch.topk(similarity, k=top_k, dim=1, sorted=False)
     maxes = values.max(dim=1, keepdim=True).values
     x_exp = torch.exp(values - maxes)
     x_exp /= torch.sum(x_exp, dim=1, keepdim=True)
@@ -536,7 +536,7 @@ def _merge_topk(
         indices = torch.cat([curr_indices, new_indices], dim=1)
 
     if values.shape[1] > top_k:
-        values, order = torch.topk(values, k=top_k, dim=1)
+        values, order = torch.topk(values, k=top_k, dim=1, sorted=False)
         indices = indices.gather(1, order)
     return values, indices
 
@@ -594,7 +594,7 @@ def _chunked_topk_softmax_sparse(
             sim_chunk *= scale
 
             chunk_k = min(top_k, end - start)
-            chunk_values, local_indices = torch.topk(sim_chunk, k=chunk_k, dim=1)
+            chunk_values, local_indices = torch.topk(sim_chunk, k=chunk_k, dim=1, sorted=False)
             token_indices = torch.arange(start,
                                          end,
                                          device=mk.device,
@@ -729,7 +729,7 @@ def _triton_topk_affinity(
     with section('affinity_select_topk'):
         candidate_values = block_values.reshape(bs, hw, num_blocks * topk_pad)
         candidate_indices = block_indices.reshape(bs, hw, num_blocks * topk_pad)
-        topk_values_hw, order = torch.topk(candidate_values, k=top_k, dim=2)
+        topk_values_hw, order = torch.topk(candidate_values, k=top_k, dim=2, sorted=False)
         indices_hw = candidate_indices.gather(2, order)
 
     with section('affinity_softmax'):
