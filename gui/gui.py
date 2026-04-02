@@ -221,6 +221,12 @@ class GUI(QWidget):
         self.crf_checkbox.setToolTip('Apply Dense CRF to snap mask boundaries to image edges')
         self.crf_checkbox.stateChanged.connect(controller.on_crf_toggle)
 
+        # soft mask saving toggle
+        self.save_soft_mask_checkbox = QCheckBox('Save soft masks')
+        self.save_soft_mask_checkbox.setChecked(False)
+        self.save_soft_mask_checkbox.setToolTip('Save per-object soft probability masks alongside hard masks')
+        self.save_soft_mask_checkbox.stateChanged.connect(controller.on_save_soft_mask_toggle)
+
         # universal progressbar
         self.progressbar = QProgressBar()
         self.progressbar.setMinimum(0)
@@ -428,6 +434,7 @@ class GUI(QWidget):
         control_topbox.addWidget(self.backward_run_button)
         control_topbox.addWidget(self.fill_gaps_checkbox)
         control_topbox.addWidget(self.crf_checkbox)
+        control_topbox.addWidget(self.save_soft_mask_checkbox)
         control_botbox.addWidget(self.progressbar)
         control_subbox.addLayout(control_topbox)
         control_subbox.addLayout(control_botbox)
