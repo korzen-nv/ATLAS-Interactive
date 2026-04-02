@@ -27,18 +27,11 @@ def torch_mask_to_numpy_uint8(mask: torch.Tensor):
 
 
 def torch_prob_to_numpy_mask_weighted(prob: torch.Tensor,
-                                       weights: torch.Tensor,
-                                       mode: str = 'multiply') -> np.ndarray:
-    """Convert (C, H, W) probabilities to (H, W) index mask with per-class power weights.
-
-    Args:
-        prob: (num_objects+1, H, W) probability tensor.
-        weights: (num_objects+1,) tensor of per-class weights (index 0 = background).
-        mode: 'multiply' — ``prob * w``, or 'exponent' — ``prob ** w``.
-    """
+                                      weights: torch.Tensor,
+                                      mode: str = 'multiply') -> np.ndarray:
+    """Convert probabilities to a uint8 mask after applying class weights."""
     w = weights.to(prob.device).view(-1, 1, 1)
     if mode == 'exponent':
-        # clamp prob to avoid 0**negative
         adjusted = prob.clamp(min=1e-7) ** w
     else:
         adjusted = prob * w

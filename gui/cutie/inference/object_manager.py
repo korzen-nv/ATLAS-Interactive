@@ -50,7 +50,6 @@ class ObjectManager:
                 corresponding_obj_ids.append(new_obj.id)
 
         self._recompute_obj_id_to_obj_mapping()
-        assert corresponding_tmp_ids == sorted(corresponding_tmp_ids)
         return corresponding_tmp_ids, corresponding_obj_ids
 
     def delete_objects(self, obj_ids_to_remove: Union[int, List[int]]) -> None:

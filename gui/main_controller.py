@@ -718,7 +718,9 @@ class MainController():
                 self.vis_mode, self.vis_target_objects,
                 alpha=self._vis_alpha(),
                 overlay_tensor=self.overlay_layer_torch)
+            # GL path does NOT mutate curr_image_torch — keep it valid
 
+            # Save visualization to disk if requested (requires CPU materialization)
             save_visualization = self.save_visualization_mode in [
                 'Propagation only (higher quality)', 'Always'
             ]
@@ -2004,6 +2006,7 @@ class MainController():
         self._snapshot_mask()
         self.convert_current_image_mask_torch()
         self.curr_prob = _apply_crf(self.curr_image_np, self.curr_prob)
+        self.curr_mask = self._prob_to_mask(self.curr_prob)
         self.curr_mask = self._prob_to_mask(self.curr_prob)
         self.save_current_mask()
         self.show_current_frame()

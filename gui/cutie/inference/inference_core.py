@@ -21,20 +21,48 @@ if TYPE_CHECKING:
 log = logging.getLogger()
 
 
-def _infer_nonempty_prob_mask_objects(mask: torch.Tensor) -> tuple[list[int], torch.Tensor]:
+def _infer_nonempty_prob_mask_objects(
+        mask: torch.Tensor,
+        preserve_objects: Optional[list[int]] = None) -> tuple[list[int], torch.Tensor]:
     flat_mask = mask.flatten(start_dim=1)
     active = flat_mask.amax(dim=1) > 0
     active_indices = torch.nonzero(active, as_tuple=False).flatten()
+    preserved = []
+    if preserve_objects is not None:
+        preserved = sorted({obj for obj in preserve_objects if 1 <= obj <= mask.shape[0]})
+
     if active_indices.numel() == 0:
+        if preserved:
+            keep = torch.tensor([obj - 1 for obj in preserved], device=mask.device, dtype=torch.long)
+            return preserved, mask.index_select(0, keep)
         objects = list(range(1, mask.shape[0] + 1))
         return objects, mask
 
     objects = (active_indices + 1).tolist()
+    if preserved:
+        objects = sorted(set(objects) | set(preserved))
+        if objects == list(range(1, mask.shape[0] + 1)):
+            return objects, mask
+        keep = torch.tensor([obj - 1 for obj in objects], device=mask.device, dtype=torch.long)
+        return objects, mask.index_select(0, keep)
     if active_indices.numel() == mask.shape[0]:
         return objects, mask
     return objects, mask.index_select(0, active_indices)
 
 
+def _masks_by_tmp_id(
+        mask: torch.Tensor,
+        objects: list[int],
+        corresponding_tmp_ids: list[int],
+        *,
+        idx_mask: bool) -> dict[int, torch.Tensor]:
+    masks_by_tmp_id = {}
+    for mask_id, tmp_id in enumerate(corresponding_tmp_ids):
+        if idx_mask:
+            masks_by_tmp_id[tmp_id] = (mask == objects[mask_id])
+        else:
+            masks_by_tmp_id[tmp_id] = mask[mask_id]
+    return masks_by_tmp_id
 class _StepProfiler:
     """Lightweight CUDA-event profiler for InferenceCore.step().
 
@@ -267,6 +295,10 @@ class InferenceCore:
                                device=key.device,
                                dtype=key.dtype)
 
+        # Propagation clears sensory memory between runs; if a partial mask forces
+        # segmentation before the next add-memory pass, restore zero sensory state
+        # for the already-tracked objects so memory readout can proceed.
+        self.memory.initialize_sensory_if_needed(key, self.object_manager.all_obj_ids)
         self.profiler.mark('mem_read')
 
         # Build TRT readout callback if available
@@ -356,8 +388,11 @@ class InferenceCore:
             assert not idx_mask
             # One-hot probability masks often include every configured object
             # channel even when most are empty. Drop empty channels here so the
-            # internal active-object set matches the actual mask content.
-            objects, mask = _infer_nonempty_prob_mask_objects(mask)
+            # internal active-object set matches the actual mask content, while
+            # keeping currently tracked objects so explicit zeroed channels are
+            # preserved as removals rather than discarded.
+            objects, mask = _infer_nonempty_prob_mask_objects(
+                mask, preserve_objects=self.object_manager.all_obj_ids)
 
         # resize input if needed -- currently only used for the GUI
         resize_needed = False
@@ -429,6 +464,8 @@ class InferenceCore:
             corresponding_tmp_ids, _ = self.object_manager.add_new_objects(objects)
 
             mask, _ = pad_divide_by(mask, 16)
+            masks_by_tmp_id = _masks_by_tmp_id(
+                mask, objects, corresponding_tmp_ids, idx_mask=idx_mask)
             if need_segment:
                 # merge predicted mask with the incomplete input mask
                 pred_prob_no_bg = pred_prob_with_bg[1:]
@@ -436,21 +473,21 @@ class InferenceCore:
                 if idx_mask:
                     pred_prob_no_bg[:, mask > 0] = 0
                 else:
-                    pred_prob_no_bg[:, mask.max(0) > 0.5] = 0
+                    pred_prob_no_bg[:, mask.amax(dim=0) > 0.5] = 0
 
-                new_masks = []
-                for mask_id, tmp_id in enumerate(corresponding_tmp_ids):
-                    if idx_mask:
-                        this_mask = (mask == objects[mask_id]).type_as(pred_prob_no_bg)
-                    else:
-                        this_mask = mask[tmp_id]
+                new_masks = {}
+                for tmp_id in sorted(masks_by_tmp_id):
+                    this_mask = masks_by_tmp_id[tmp_id].type_as(pred_prob_no_bg)
                     if tmp_id > pred_prob_no_bg.shape[0]:
-                        new_masks.append(this_mask.unsqueeze(0))
+                        new_masks[tmp_id] = this_mask
                     else:
                         # +1 for padding the background channel
                         pred_prob_no_bg[tmp_id - 1] = this_mask
-                # new_masks are always in the order of tmp_id
-                mask = torch.cat([pred_prob_no_bg, *new_masks], dim=0)
+                if new_masks:
+                    appended_masks = [new_masks[tmp_id].unsqueeze(0) for tmp_id in sorted(new_masks)]
+                    mask = torch.cat([pred_prob_no_bg, *appended_masks], dim=0)
+                else:
+                    mask = pred_prob_no_bg
             elif idx_mask:
                 # simply convert cls to one-hot representation
                 if len(objects) == 0:
@@ -460,9 +497,15 @@ class InferenceCore:
                     return torch.zeros((1, key.shape[-2] * 16, key.shape[-1] * 16),
                                        device=key.device,
                                        dtype=key.dtype)
-                mask = torch.stack(
-                    [mask == objects[mask_id] for mask_id, _ in enumerate(corresponding_tmp_ids)],
-                    dim=0)
+                zero_mask = mask.new_zeros(mask.shape[-2:])
+                mask = torch.stack([masks_by_tmp_id.get(tmp_id, zero_mask)
+                                    for tmp_id in range(1, self.object_manager.num_obj + 1)],
+                                   dim=0)
+            else:
+                zero_mask = mask.new_zeros(mask.shape[-2:])
+                mask = torch.stack([masks_by_tmp_id.get(tmp_id, zero_mask)
+                                    for tmp_id in range(1, self.object_manager.num_obj + 1)],
+                                   dim=0)
             pred_prob_with_bg = aggregate(mask, dim=0)
             pred_prob_with_bg = torch.softmax(pred_prob_with_bg, dim=0)
 
