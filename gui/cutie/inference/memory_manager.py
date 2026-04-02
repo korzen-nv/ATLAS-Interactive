@@ -56,6 +56,7 @@ class MemoryManager:
         if self.use_long_term:
             self.long_mem = KeyValueMemoryStore(save_usage=self.count_long_term_usage)
 
+        self.bucket_value_token_major_cache = {}
         self.config_stale = True
         self.engaged = False
 
@@ -119,6 +120,15 @@ class MemoryManager:
             lt_value = torch.stack([self.long_mem.value_token_major[obj] for obj in obj_ids], dim=1)
             value = torch.cat([lt_value, value], dim=2)
 
+        return value
+
+    def _get_bucket_visual_values_token_major(self, bucket_id: int,
+                                              obj_ids: List[int]) -> torch.Tensor:
+        cached = self.bucket_value_token_major_cache.get(bucket_id)
+        if cached is not None:
+            return cached
+        value = self._get_visual_values_token_major_by_ids(obj_ids)
+        self.bucket_value_token_major_cache[bucket_id] = value
         return value
 
     def read(self, pix_feat: torch.Tensor, query_key: torch.Tensor, selection: torch.Tensor,
@@ -211,16 +221,22 @@ class MemoryManager:
                 ]
 
             for objects in object_chunks:
-                this_sensory = self._get_sensory_by_ids(objects)
-                this_last_mask = self._get_mask_by_ids(last_mask, objects)
-                resolved_readout_backend = _resolve_sparse_backend(self.readout_backend,
-                                                                   topk_weights)
-                if resolved_readout_backend == 'triton':
-                    this_msk_value = None
-                    this_msk_value_t = self._get_visual_values_token_major_by_ids(objects)
-                else:
-                    this_msk_value = self._get_visual_values_by_ids(objects)
-                    this_msk_value_t = None
+                with section('read_fetch_state'):
+                    this_sensory = self._get_sensory_by_ids(objects)
+                    this_last_mask = self._get_mask_by_ids(last_mask, objects)
+                with section('read_fetch_values'):
+                    resolved_readout_backend = _resolve_sparse_backend(self.readout_backend,
+                                                                       topk_weights)
+                    if resolved_readout_backend == 'triton':
+                        this_msk_value = None
+                        if len(objects) == len(bucket):
+                            this_msk_value_t = self._get_bucket_visual_values_token_major(
+                                bucket_id, objects)
+                        else:
+                            this_msk_value_t = self._get_visual_values_token_major_by_ids(objects)
+                    else:
+                        this_msk_value = self._get_visual_values_by_ids(objects)
+                        this_msk_value_t = None
                 with section('sparse_readout'):
                     visual_readout = sparse_readout(
                         this_msk_value,
@@ -230,8 +246,9 @@ class MemoryManager:
                         v_token_major=this_msk_value_t,
                     ).view(bs, len(objects), self.CV, h, w)
 
-                this_obj_mem = self._get_object_mem_by_ids(objects)
-                this_obj_mem = this_obj_mem.unsqueeze(2) if this_obj_mem is not None else None
+                with section('read_fetch_objmem'):
+                    this_obj_mem = self._get_object_mem_by_ids(objects)
+                    this_obj_mem = this_obj_mem.unsqueeze(2) if this_obj_mem is not None else None
 
                 if readout_fn is not None:
                     # TRT path: caller-provided function replaces
@@ -250,8 +267,9 @@ class MemoryManager:
                     readout_memory, aux_features = network.readout_query(
                         pixel_readout, this_obj_mem, profiler=profiler)
 
-                for i, obj in enumerate(objects):
-                    all_readout_mem[obj] = readout_memory[:, i]
+                with section('read_pack_output'):
+                    for i, obj in enumerate(objects):
+                        all_readout_mem[obj] = readout_memory[:, i]
 
                 if self.save_aux:
                     aux_output = {
@@ -353,6 +371,7 @@ class MemoryManager:
             else:
                 # FIFO
                 self.work_mem.remove_old_memory(bucket_id, self.max_work_tokens)
+        self.bucket_value_token_major_cache.clear()
 
     def purge_except(self, obj_keep_idx: List[int]) -> None:
         # purge certain objects from the memory except the one listed
@@ -360,6 +379,7 @@ class MemoryManager:
         if self.use_long_term and self.long_mem.engaged():
             self.long_mem.purge_except(obj_keep_idx)
         self.sensory = {k: v for k, v in self.sensory.items() if k in obj_keep_idx}
+        self.bucket_value_token_major_cache.clear()
 
         if not self.work_mem.engaged():
             # everything is removed!
@@ -437,6 +457,7 @@ class MemoryManager:
         self.work_mem.clear_non_permanent_memory()
         if self.use_long_term:
             self.long_mem.clear_non_permanent_memory()
+        self.bucket_value_token_major_cache.clear()
 
     def clear_sensory_memory(self):
         self.sensory = {}

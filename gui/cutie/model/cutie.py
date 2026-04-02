@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from typing import List, Dict
 import logging
 from omegaconf import DictConfig
@@ -72,19 +73,24 @@ class CUTIE(nn.Module):
             *,
             deep_update: bool = True,
             chunk_size: int = -1,
-            need_weights: bool = False) -> (torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor):
+            need_weights: bool = False,
+            profiler=None) -> (torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor):
         image = (image - self.pixel_mean) / self.pixel_std
         others = self._get_others(masks)
-        mask_value, new_sensory = self.mask_encoder(image,
-                                                    ms_features,
-                                                    sensory,
-                                                    masks,
-                                                    others,
-                                                    deep_update=deep_update,
-                                                    chunk_size=chunk_size)
+        section = profiler.section if profiler is not None else nullcontext
+        with section('mask_encoder'):
+            mask_value, new_sensory = self.mask_encoder(image,
+                                                        ms_features,
+                                                        sensory,
+                                                        masks,
+                                                        others,
+                                                        deep_update=deep_update,
+                                                        chunk_size=chunk_size)
         if self.object_transformer_enabled:
-            object_summaries, object_logits = self.object_summarizer(masks, mask_value,
-                                                                     need_weights)
+            with section('object_summarizer'):
+                object_summaries, object_logits = self.object_summarizer(masks,
+                                                                         mask_value,
+                                                                         need_weights)
         else:
             object_summaries, object_logits = None, None
         return mask_value, new_sensory, object_summaries, object_logits

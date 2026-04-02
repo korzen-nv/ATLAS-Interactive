@@ -193,7 +193,7 @@ def _get_padded_hw(cfg, torch_rt):
 def _try_build_trt(cutie, cfg, torch_rt, device):
     """Attempt to build TRT engines for encoder, mask decoder, and readout."""
     try:
-        from gui.trt_engine import TRTEncoder, TRTMaskDecoder, TRTReadout
+        from gui.trt_engine import TRTEncoder, TRTMaskDecoderManager, TRTReadout
     except ImportError:
         return None, None, None
 
@@ -207,9 +207,13 @@ def _try_build_trt(cutie, cfg, torch_rt, device):
         weights_path=weights_path, fp16=fp16, device=device,
     )
 
-    trt_mask_decoder = TRTMaskDecoder.build(
-        cutie, (ph, pw), NO,
-        weights_path=weights_path, fp16=fp16, device=device,
+    trt_mask_decoder = TRTMaskDecoderManager(
+        cutie,
+        (ph, pw),
+        weights_path=weights_path,
+        fp16=fp16,
+        device=device,
+        fallback_num_objects=NO,
     )
 
     # TRT readout disabled: ONNX→TRT produces incorrect output despite
