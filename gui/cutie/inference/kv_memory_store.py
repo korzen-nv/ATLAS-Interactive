@@ -16,6 +16,20 @@ def _add_last_dim(dictionary, key, new_value, prepend=False):
         dictionary[key] = new_value
 
 
+def _transpose_value_token_major(value: torch.Tensor) -> torch.Tensor:
+    return value.transpose(1, 2).contiguous()
+
+
+def _add_token_major(dictionary, key, new_value, prepend=False):
+    if key in dictionary:
+        if prepend:
+            dictionary[key] = torch.cat([new_value, dictionary[key]], dim=1)
+        else:
+            dictionary[key] = torch.cat([dictionary[key], new_value], dim=1)
+    else:
+        dictionary[key] = new_value
+
+
 class KeyValueMemoryStore:
     """
     Works for key/value pairs type storage
@@ -38,6 +52,7 @@ class KeyValueMemoryStore:
         self.buckets: Dict[int, List[int]] = {}  # indexed by bucket id
         self.k: Dict[int, torch.Tensor] = {}  # indexed by bucket id
         self.v: Dict[int, torch.Tensor] = {}  # indexed by object id
+        self.v_t: Dict[int, torch.Tensor] = {}  # indexed by object id, token-major (bs*N*C)
 
         # indexed by bucket id; the end point of permanent memory
         self.perm_end_pt: Dict[int, int] = defaultdict(int)
@@ -86,11 +101,17 @@ class KeyValueMemoryStore:
             for obj, value in values.items():
                 if bucket_exist:
                     assert obj in self.v
+                    assert obj in self.v_t
                     assert obj in self.buckets[supposed_bucket_id]
                     _add_last_dim(self.v, obj, value, prepend=(as_permanent == 'all'))
+                    _add_token_major(self.v_t,
+                                     obj,
+                                     _transpose_value_token_major(value),
+                                     prepend=(as_permanent == 'all'))
                 else:
                     assert obj not in self.v
                     self.v[obj] = value
+                    self.v_t[obj] = _transpose_value_token_major(value)
             self.buckets[supposed_bucket_id] = list(values.keys())
         else:
             new_bucket_id = None
@@ -99,6 +120,10 @@ class KeyValueMemoryStore:
                 assert len(value.shape) == 3
                 if obj in self.v:
                     _add_last_dim(self.v, obj, value, prepend=(as_permanent == 'all'))
+                    _add_token_major(self.v_t,
+                                     obj,
+                                     _transpose_value_token_major(value),
+                                     prepend=(as_permanent == 'all'))
                     bucket_used = [
                         bucket_id for bucket_id, object_ids in self.buckets.items()
                         if obj in object_ids
@@ -107,6 +132,7 @@ class KeyValueMemoryStore:
                     enabled_buckets.add(bucket_used[0])
                 else:
                     self.v[obj] = value
+                    self.v_t[obj] = _transpose_value_token_major(value)
                     if new_bucket_id is None:
                         # create new bucket
                         new_bucket_id = self.global_bucket_id
@@ -202,6 +228,8 @@ class KeyValueMemoryStore:
         for obj_id in object_ids:
             v = self.v[obj_id]
             self.v[obj_id] = torch.cat([v[:, :, :start], v[:, :, end:]], -1)
+            v_t = self.v_t[obj_id]
+            self.v_t[obj_id] = torch.cat([v_t[:, :start], v_t[:, end:]], 1)
 
     def remove_old_memory(self, bucket_id: int, max_len: int) -> None:
         self.sieve_by_range(bucket_id, 0, -max_len, max_len)
@@ -235,6 +263,8 @@ class KeyValueMemoryStore:
         for obj_id in object_ids:
             self.v[obj_id] = torch.stack(
                 [self.v[obj_id][bi, :, survived] for bi, survived in enumerate(survivals)], 0)
+            self.v_t[obj_id] = torch.stack(
+                [self.v_t[obj_id][bi, survived] for bi, survived in enumerate(survivals)], 0)
 
         self.use_cnt[bucket_id] = torch.stack(
             [self.use_cnt[bucket_id][bi, survived] for bi, survived in enumerate(survivals)], 0)
@@ -290,6 +320,7 @@ class KeyValueMemoryStore:
 
         # remove object values that are not in the keep list
         self.v = {k: v for k, v in self.v.items() if k in obj_keep_idx}
+        self.v_t = {k: v for k, v in self.v_t.items() if k in obj_keep_idx}
 
         # remove buckets that are empty
         for bucket_id in buckets_to_remove:
@@ -339,6 +370,10 @@ class KeyValueMemoryStore:
     @property
     def value(self) -> Dict[int, torch.Tensor]:
         return self.v
+
+    @property
+    def value_token_major(self) -> Dict[int, torch.Tensor]:
+        return self.v_t
 
     @property
     def shrinkage(self) -> Dict[int, torch.Tensor]:
