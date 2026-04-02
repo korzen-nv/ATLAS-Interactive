@@ -124,8 +124,12 @@ class MainController():
         self.save_soft_mask: bool = False
         self.fill_gaps: bool = False
 
+        # mask slot tracking (None = primary "masks" dir)
+        self._current_mask_slot = None
+
         # class power weights: index 0 = background (always 1.0), 1..N = per-class
         self.class_power_weights = torch.ones(self.num_objects + 1, dtype=torch.float)
+        self.global_power_weight: float = 1.0
         self.class_power_mode: str = 'multiply'  # 'multiply' or 'exponent'
 
         self.interacted_prob: torch.Tensor = None
@@ -171,6 +175,7 @@ class MainController():
 
         self.gui.show()
         self._refresh_global_memory_list()
+        self._update_mask_slot_button()
         self.gui.text('Initialized.')
         self.initialized = True
 
@@ -537,8 +542,16 @@ class MainController():
         # fast path, uses gpu. Changes the image in-place to avoid copying
         # thus current_image_torch must be voided afterwards
         # do_no_save_soft_mask is an override to solve #41
+        # Apply class power weights to visualization so the preview matches the saved mask
+        vis_prob = self.curr_prob
+        if self._has_non_default_class_power() and vis_prob is not None:
+            w = self._effective_weights().to(vis_prob.device).view(-1, 1, 1)
+            if self.class_power_mode == 'exponent':
+                vis_prob = vis_prob.clamp(min=1e-7) ** w
+            else:
+                vis_prob = vis_prob * w
         self.vis_image = get_visualization_torch(self.vis_mode, self.curr_image_torch,
-                                                 self.curr_prob, self.overlay_layer_torch,
+                                                 vis_prob, self.overlay_layer_torch,
                                                  self.vis_target_objects,
                                                  selected_obj=self.curr_object)
         self.curr_image_torch = None
@@ -566,6 +579,14 @@ class MainController():
 
         self.gui.update_slider(self.curr_ti)
         self.gui.frame_name.setText(self.res_man.names[self.curr_ti] + '.jpg')
+        if not self.propagating:
+            has_soft = self.res_man.load_soft_mask(self.curr_ti, self.num_objects) is not None
+            if has_soft:
+                self.gui.soft_mask_indicator.setText('soft')
+                self.gui.soft_mask_indicator.setStyleSheet(
+                    'color: #00cc66; font-size: 10px; font-weight: bold;')
+            else:
+                self.gui.soft_mask_indicator.setText('')
 
     def set_vis_mode(self):
         self.vis_mode = self.gui.combo.currentText()
@@ -1476,32 +1497,126 @@ class MainController():
         self._open_in_explorer(folder_path)
         self.gui.text(f'Opening {folder_path}')
 
+    # ── Mask slot management (snapshot / switch / clear-to-end) ──────
+
+    def on_snapshot_masks(self):
+        """Copy the current masks to a named slot for comparison."""
+        if self.propagating:
+            return
+        from PySide6.QtWidgets import QInputDialog
+        default_name = str(self.res_man.next_free_mask_slot())
+        name, ok = QInputDialog.getText(
+            self.gui, 'Snapshot masks',
+            'Folder suffix (will be saved as masks_<name>):',
+            text=default_name,
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        self.gui.text(f'Saving mask snapshot to masks_{name}...')
+        self.gui.process_events()
+        self.res_man.snapshot_masks_named(name)
+        self.gui.text(f'Masks copied to masks_{name}.')
+        self._update_mask_slot_button()
+
+    def on_switch_mask_slot(self):
+        """Cycle through mask slots: masks → masks_2 → masks_3 → ... → masks."""
+        if self.propagating:
+            return
+        slots = self.res_man.get_available_mask_slots()  # e.g. ['2', '3', 'exp_a']
+        if not slots:
+            self.gui.text('No mask snapshots to switch to. Use Snapshot first.')
+            return
+
+        # Build cycle: None (primary) → '2' → '3' → 'exp_a' → None → ...
+        cycle = [None] + slots
+        current = self._current_mask_slot
+        try:
+            idx = cycle.index(current)
+            next_slot = cycle[(idx + 1) % len(cycle)]
+        except ValueError:
+            next_slot = cycle[0]
+
+        self.res_man.switch_mask_dir(next_slot)
+        self._current_mask_slot = next_slot
+        # Reload current frame from the new mask dir
+        self.load_current_image_mask()
+        self.show_current_frame()
+        label = 'masks' if next_slot is None else f'masks_{next_slot}'
+        self.gui.text(f'Switched to {label}.')
+        self._update_mask_slot_button()
+
+    def on_clear_masks_to_end(self):
+        """Remove all mask files from the current frame to the end of the video."""
+        if self.propagating:
+            return
+        from PySide6.QtWidgets import QMessageBox
+        remaining = self.T - self.curr_ti
+        reply = QMessageBox.question(
+            self.gui, 'Clear masks to end',
+            f'Delete all masks from frame {self.curr_ti} to end ({remaining} frames)?\n'
+            'This cannot be undone.',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.gui.text(f'Clearing masks from frame {self.curr_ti} to end...')
+        self.gui.process_events()
+        deleted = self.res_man.delete_masks_from_frame(self.curr_ti)
+        # Reload current frame
+        self.load_current_image_mask()
+        self.show_current_frame()
+        self.gui.text(f'Deleted {deleted} mask(s) from frame {self.curr_ti} to end.')
+
+    def _update_mask_slot_button(self):
+        slot = self._current_mask_slot
+        label = 'masks' if slot is None else f'masks_{slot}'
+        slots = self.res_man.get_available_mask_slots()
+        n = len(slots)
+        self.gui.switch_mask_slot_button.setText(f'Switch [{label}] ({n})')
+
     def on_save_soft_mask_toggle(self):
         self.save_soft_mask = self.gui.save_soft_mask_checkbox.isChecked()
 
     # ── Class Power callbacks ────────────────────────────────────────
 
     def _has_non_default_class_power(self) -> bool:
-        """Return True if any class power weight differs from 1.0."""
+        """Return True if any class power weight or global power differs from 1.0."""
+        if self.global_power_weight != 1.0:
+            return True
         return not torch.allclose(self.class_power_weights,
                                   torch.ones_like(self.class_power_weights))
+
+    def _effective_weights(self) -> torch.Tensor:
+        """Return class power weights with global multiplier applied to foreground channels."""
+        w = self.class_power_weights.clone()
+        w[1:] *= self.global_power_weight
+        return w
 
     def _prob_to_mask(self, prob: torch.Tensor) -> np.ndarray:
         """Central prob→mask conversion, applying class power when active."""
         if self._has_non_default_class_power():
             return torch_prob_to_numpy_mask_weighted(
-                prob, self.class_power_weights, self.class_power_mode)
+                prob, self._effective_weights(), self.class_power_mode)
         return torch_prob_to_numpy_mask(prob)
+
+    def on_global_power_changed(self, value: float):
+        """Called by GUI when the global soft mask power slider changes."""
+        self.global_power_weight = value
+        # live update: recompute mask from existing prob (only when soft masks are available)
+        if self.curr_prob is not None:
+            self.curr_mask = self._prob_to_mask(self.curr_prob)
+            if self.fill_gaps:
+                self.curr_mask = self.fill_mask_gaps(self.curr_mask)
+            self.save_current_mask()
+            self.show_current_frame()
 
     def on_class_power_changed(self, obj_id: int, value: float):
         """Called by GUI when a per-class power slider changes."""
         self.class_power_weights[obj_id] = value
-        # auto-enable soft mask saving so probabilities survive frame navigation
-        if self._has_non_default_class_power() and not self.save_soft_mask:
-            self.save_soft_mask = True
-            self.gui.save_soft_mask_checkbox.setChecked(True)
-            self.gui.text('Soft mask saving auto-enabled for class power tuning.')
-        # live update: recompute mask from existing prob
+        # live update: recompute mask from existing prob (only when soft masks are available)
         if self.curr_prob is not None:
             self.curr_mask = self._prob_to_mask(self.curr_prob)
             if self.fill_gaps:
@@ -1520,8 +1635,9 @@ class MainController():
             self.show_current_frame()
 
     def on_class_power_reset(self):
-        """Reset all class power weights to 1.0."""
+        """Reset all class power weights (including global) to 1.0."""
         self.class_power_weights.fill_(1.0)
+        self.global_power_weight = 1.0
         self.gui.reset_class_power_sliders()
         if self.curr_prob is not None:
             self.curr_mask = self._prob_to_mask(self.curr_prob)

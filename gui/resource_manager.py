@@ -447,6 +447,67 @@ class ResourceManager:
     def __len__(self):
         return self.length
 
+    # ── Mask slot management (snapshot / switch) ─────────────────────
+
+    def get_available_mask_slots(self) -> list[str]:
+        """Return sorted list of mask slot names that exist (e.g. ['2', '3', 'exp_a'])."""
+        slots = []
+        for entry in os.listdir(self.workspace):
+            if entry.startswith('masks_') and path.isdir(path.join(self.workspace, entry)):
+                suffix = entry.split('_', 1)[1]
+                if suffix:
+                    slots.append(suffix)
+        return sorted(slots)
+
+    def next_free_mask_slot(self) -> int:
+        """Return the lowest available numeric slot for a new snapshot."""
+        existing = self.get_available_mask_slots()
+        n = 2
+        while str(n) in existing:
+            n += 1
+        return n
+
+    def snapshot_masks_named(self, name: str) -> str:
+        """Copy current masks dir to masks_<name>. Returns the name used."""
+        dest = path.join(self.workspace, f'masks_{name}')
+        # Wait for pending saves to flush
+        self.save_queue.join()
+        if path.exists(dest):
+            shutil.rmtree(dest)
+        shutil.copytree(self.mask_dir, dest)
+        return name
+
+    def switch_mask_dir(self, slot: str = None):
+        """Switch the active mask directory.
+
+        slot=None → workspace/masks (the primary slot)
+        slot=str  → workspace/masks_<slot>
+        """
+        if slot is None:
+            new_dir = path.join(self.workspace, 'masks')
+        else:
+            new_dir = path.join(self.workspace, f'masks_{slot}')
+        if not path.exists(new_dir):
+            raise FileNotFoundError(new_dir)
+        # Wait for any pending saves before switching
+        self.save_queue.join()
+        self.mask_dir = new_dir
+        # Invalidate entire mask cache so frames are re-read from the new dir
+        with self.get_mask.lock:
+            self.get_mask.cache.clear()
+
+    def delete_masks_from_frame(self, start_ti: int):
+        """Delete mask files on disk from start_ti to end. Returns count deleted."""
+        deleted = 0
+        for ti in range(start_ti, self.length):
+            mask_path = path.join(self.mask_dir, self.names[ti] + '.png')
+            if path.exists(mask_path):
+                os.remove(mask_path)
+                deleted += 1
+            # Invalidate cache for this frame
+            self.get_mask.invalidate((ti,))
+        return deleted
+
     @property
     def T(self) -> int:
         return self.length

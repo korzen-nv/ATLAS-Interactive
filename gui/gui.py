@@ -242,6 +242,19 @@ class GUI(QWidget):
         self.remove_object_all_button = QPushButton('Remove object (all frames)')
         self.remove_object_all_button.clicked.connect(controller.on_remove_object_all_frames)
 
+        # Mask slot management
+        self.snapshot_masks_button = QPushButton('Snapshot masks')
+        self.snapshot_masks_button.setToolTip('Copy current masks to a new slot for comparison')
+        self.snapshot_masks_button.clicked.connect(controller.on_snapshot_masks)
+
+        self.switch_mask_slot_button = QPushButton('Switch [masks] (0)')
+        self.switch_mask_slot_button.setToolTip('Cycle through mask snapshots')
+        self.switch_mask_slot_button.clicked.connect(controller.on_switch_mask_slot)
+
+        self.clear_masks_to_end_button = QPushButton('Clear masks → end')
+        self.clear_masks_to_end_button.setToolTip('Delete all masks from current frame to the end')
+        self.clear_masks_to_end_button.clicked.connect(controller.on_clear_masks_to_end)
+
         # set up the LCD
         self.lcd = QTextEdit()
         self.lcd.setReadOnly(True)
@@ -272,6 +285,10 @@ class GUI(QWidget):
         self.frame_name = QLabel()
         self.frame_name.setMinimumSize(100, 30)
         self.frame_name.setAlignment(Qt.AlignmentFlag.AlignLeft)
+
+        self.soft_mask_indicator = QLabel('')
+        self.soft_mask_indicator.setFixedHeight(20)
+        self.soft_mask_indicator.setStyleSheet('color: #888; font-size: 10px;')
 
         # timeline slider
         self.tl_slider = MarkerSlider(Qt.Orientation.Horizontal)
@@ -397,7 +414,11 @@ class GUI(QWidget):
         interact_topbox.addWidget(self.reset_frame_button)
         interact_topbox.addWidget(self.reset_object_button)
         interact_topbox.addWidget(self.remove_object_all_button)
+        interact_topbox.addWidget(self.snapshot_masks_button)
+        interact_topbox.addWidget(self.switch_mask_slot_button)
+        interact_topbox.addWidget(self.clear_masks_to_end_button)
         interact_topbox.addWidget(self.frame_name)
+        interact_topbox.addWidget(self.soft_mask_indicator)
 
         interact_botbox.addWidget(self.object_color)
         interact_botbox.addWidget(QLabel('ID:'))
@@ -614,6 +635,14 @@ class GUI(QWidget):
                     self).activated.connect(functools.partial(controller.on_brush_size_change, -2))
         QShortcut(QKeySequence(Qt.Key.Key_BracketRight),
                     self).activated.connect(functools.partial(controller.on_brush_size_change, 2))
+
+        # mask slot management
+        QShortcut(QKeySequence(Qt.Key.Key_S | Qt.KeyboardModifier.ControlModifier),
+                    self).activated.connect(controller.on_snapshot_masks)
+        QShortcut(QKeySequence(Qt.Key.Key_W),
+                    self).activated.connect(controller.on_switch_mask_slot)
+        QShortcut(QKeySequence(Qt.Key.Key_X | Qt.KeyboardModifier.ShiftModifier),
+                    self).activated.connect(controller.on_clear_masks_to_end)
 
         # quit shortcut
         QShortcut(QKeySequence(Qt.Key.Key_Q), self).activated.connect(self.close)
@@ -834,6 +863,27 @@ class GUI(QWidget):
         self.power_mode_group.buttonClicked.connect(
             lambda _btn: controller.on_class_power_mode_changed())
 
+        # Global soft mask power slider
+        global_label_row = QHBoxLayout()
+        global_label_row.setSpacing(4)
+        global_lbl = QLabel('Global')
+        global_lbl.setStyleSheet('font-weight: bold;')
+        global_label_row.addWidget(global_lbl)
+        self.global_power_label = QLabel('1.00')
+        self.global_power_label.setFixedWidth(40)
+        self.global_power_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        global_label_row.addWidget(self.global_power_label)
+        panel_layout.addLayout(global_label_row)
+
+        self.global_power_slider = QSlider(Qt.Orientation.Horizontal)
+        self.global_power_slider.setMinimum(1)
+        self.global_power_slider.setMaximum(10000)
+        self.global_power_slider.setValue(100)
+        self.global_power_slider.setMinimumHeight(20)
+        self.global_power_slider.setToolTip('Global soft mask multiplier (1.0 = neutral)')
+        self.global_power_slider.valueChanged.connect(self._on_global_power_slider_changed)
+        panel_layout.addWidget(self.global_power_slider)
+
         # Reset all button
         self.power_reset_button = QPushButton('Reset All to 1.0')
         self.power_reset_button.clicked.connect(controller.on_class_power_reset)
@@ -853,49 +903,45 @@ class GUI(QWidget):
         self._class_name_buttons: list[QPushButton] = []
 
         for obj_id in range(1, num_objects + 1):
-            row = QHBoxLayout()
-            row.setSpacing(4)
+            # Top row: color swatch + class name button + value label
+            top_row = QHBoxLayout()
+            top_row.setSpacing(4)
 
-            # color swatch
             swatch = QLabel()
             swatch.setFixedSize(16, 16)
             r, g, b = custom_palette_np[obj_id]
             swatch.setStyleSheet(
                 f'background-color: rgb({r},{g},{b}); border: 1px solid #888;')
-            row.addWidget(swatch)
+            top_row.addWidget(swatch)
 
-            # class name button (click to select this class)
             name = custom_names.get(obj_id, f'Class {obj_id}')
             btn = QPushButton(name)
             btn.setFixedHeight(24)
-            btn.setMaximumWidth(90)
             btn.setToolTip(f'Select class {obj_id}: {name}')
             btn.setStyleSheet('text-align: left; padding: 1px 4px; font-size: 10px;')
             btn.clicked.connect(functools.partial(controller.hit_number_key, obj_id))
             self._class_name_buttons.append(btn)
-            row.addWidget(btn)
+            top_row.addWidget(btn, 1)
 
-            # power slider (range 10..1000, representing 0.1..10.0)
-            slider = QSlider(Qt.Orientation.Horizontal)
-            slider.setMinimum(10)
-            slider.setMaximum(1000)
-            slider.setValue(100)
-            slider.setMinimumWidth(50)
-            slider.setMinimumHeight(20)
-            slider.setToolTip('Class power weight (1.0 = neutral)')
-            slider.valueChanged.connect(
-                functools.partial(self._on_class_power_slider_changed, obj_id))
-            self._class_power_sliders.append(slider)
-            row.addWidget(slider, 1)
-
-            # numeric label showing the value
             val_label = QLabel('1.00')
             val_label.setFixedWidth(40)
             val_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self._class_power_labels.append(val_label)
-            row.addWidget(val_label)
+            top_row.addWidget(val_label)
 
-            self._class_rows_layout.addLayout(row)
+            # Bottom row: slider spanning full width
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setMinimum(1)
+            slider.setMaximum(10000)
+            slider.setValue(100)
+            slider.setMinimumHeight(18)
+            slider.setToolTip('Class power weight (1.0 = neutral)')
+            slider.valueChanged.connect(
+                functools.partial(self._on_class_power_slider_changed, obj_id))
+            self._class_power_sliders.append(slider)
+
+            self._class_rows_layout.addLayout(top_row)
+            self._class_rows_layout.addWidget(slider)
 
         self._class_rows_layout.addStretch(1)
         scroll.setWidget(scroll_widget)
@@ -908,6 +954,12 @@ class GUI(QWidget):
         self._class_power_labels[idx].setText(f'{real_value:.2f}')
         self.controller.on_class_power_changed(obj_id, real_value)
 
+    def _on_global_power_slider_changed(self, value: int):
+        """Called when the global soft mask power slider moves."""
+        real_value = value / 100.0
+        self.global_power_label.setText(f'{real_value:.2f}')
+        self.controller.on_global_power_changed(real_value)
+
     def get_class_power_mode(self) -> str:
         """Return 'multiply' or 'exponent'."""
         if self.power_mode_exponent.isChecked():
@@ -919,7 +971,11 @@ class GUI(QWidget):
         return [s.value() / 100.0 for s in self._class_power_sliders]
 
     def reset_class_power_sliders(self):
-        """Reset all sliders to 1.0."""
+        """Reset all sliders (including global) to 1.0."""
+        self.global_power_slider.blockSignals(True)
+        self.global_power_slider.setValue(100)
+        self.global_power_slider.blockSignals(False)
+        self.global_power_label.setText('1.00')
         for slider in self._class_power_sliders:
             slider.blockSignals(True)
             slider.setValue(100)
