@@ -346,6 +346,31 @@ class ResourceManager:
 
         self.add_to_queue_with_warning(SaveItem('soft_mask', prob, self.names[ti]))
 
+    def load_soft_mask(self, ti: int, num_objects: int) -> Optional[np.ndarray]:
+        """Load saved soft mask for frame *ti* and return (num_objects+1, H, W) float array.
+
+        Returns None if no soft masks exist for this frame.
+        """
+        assert 0 <= ti < self.length
+        name = self.names[ti]
+        channels = []
+        for obj_id in range(1, num_objects + 1):
+            p = path.join(self.soft_mask_dir, f'{obj_id}', name + '.png')
+            if not path.exists(p):
+                return None
+            ch = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+            if ch is None:
+                return None
+            channels.append(ch.astype(np.float32) / 255.0)
+
+        h, w = channels[0].shape
+        prob = np.zeros((num_objects + 1, h, w), dtype=np.float32)
+        for i, ch in enumerate(channels):
+            prob[i + 1] = ch
+        # background = 1 - sum(foreground), clipped to [0,1]
+        prob[0] = np.clip(1.0 - prob[1:].sum(axis=0), 0, 1)
+        return prob
+
     def _get_image_unbuffered(self, ti: int):
         # returns H*W*3 uint8 array
         assert 0 <= ti < self.length

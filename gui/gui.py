@@ -7,7 +7,8 @@ from omegaconf import DictConfig
 from PySide6.QtWidgets import (QWidget, QComboBox, QCheckBox, QHBoxLayout, QLabel, QPushButton,
                                QTextEdit, QSpinBox, QPlainTextEdit, QVBoxLayout, QSizePolicy,
                                QButtonGroup, QSlider, QRadioButton, QApplication, QFileDialog,
-                               QListWidget, QListWidgetItem)
+                               QListWidget, QListWidgetItem, QScrollArea, QFrame, QDoubleSpinBox,
+                               QGroupBox)
 
 from PySide6.QtGui import (QKeySequence, QShortcut, QTextCursor, QImage, QPixmap, QIcon, QPainter,
                             QColor, QPolygonF)
@@ -290,6 +291,7 @@ class GUI(QWidget):
         self.combo.addItem("light")
         self.combo.addItem("popup")
         self.combo.addItem("rgba")
+        self.combo.addItem("soft")
         self.combo.setCurrentText('davis')
         self.combo.currentTextChanged.connect(controller.set_vis_mode)
 
@@ -379,6 +381,9 @@ class GUI(QWidget):
         self.open_workspace_button = QPushButton('Open Workspace Folder')
         self.open_workspace_button.clicked.connect(controller.on_open_workspace)
 
+        # ── Class Power Panel (left side) ──
+        self._build_class_power_panel(controller)
+
         # navigator
         navi = QHBoxLayout()
 
@@ -397,8 +402,6 @@ class GUI(QWidget):
         interact_botbox.addWidget(self.object_color)
         interact_botbox.addWidget(QLabel('ID:'))
         interact_botbox.addWidget(self.object_dial)
-        interact_botbox.addWidget(QLabel('Class:'))
-        interact_botbox.addWidget(self.object_class_combo)
         interact_botbox.addWidget(QLabel('Visualization mode'))
         interact_botbox.addWidget(self.combo)
 
@@ -442,6 +445,7 @@ class GUI(QWidget):
 
         # Drawing area main canvas
         draw_area = QHBoxLayout()
+        draw_area.addWidget(self.class_power_panel, 0)
         draw_area.addWidget(self.main_canvas, 4)
 
         # right area
@@ -562,10 +566,10 @@ class GUI(QWidget):
         # Toggle visualization mode
         QShortcut(QKeySequence(Qt.Key.Key_T), self).activated.connect(controller.on_toggle_vis_mode)
 
-        # F1-F7: switch visualization mode directly
-        vis_modes = ['image', 'mask', 'davis', 'fade', 'light', 'popup', 'rgba']
+        # F1-F8: switch visualization mode directly
+        vis_modes = ['image', 'mask', 'davis', 'fade', 'light', 'popup', 'rgba', 'soft']
         fkeys = [Qt.Key.Key_F1, Qt.Key.Key_F2, Qt.Key.Key_F3,
-                 Qt.Key.Key_F4, Qt.Key.Key_F5, Qt.Key.Key_F6, Qt.Key.Key_F7]
+                 Qt.Key.Key_F4, Qt.Key.Key_F5, Qt.Key.Key_F6, Qt.Key.Key_F7, Qt.Key.Key_F8]
         for key, mode in zip(fkeys, vis_modes):
             QShortcut(QKeySequence(key), self).activated.connect(
                 functools.partial(controller.set_vis_mode_direct, mode))
@@ -795,6 +799,143 @@ class GUI(QWidget):
         rgb = f'rgb({r},{g},{b})'
         self.object_color.setFixedSize(50, 30)  # Make it square
         self.object_color.setStyleSheet(f'QLabel {{ background-color: {rgb}; border: 1px solid #d3d3d3; }}')
+
+    # ── Class Power Panel helpers ──────────────────────────────────────
+
+    def _build_class_power_panel(self, controller):
+        """Create a scrollable left panel with one row per class: color swatch,
+        name button (click to select), and a power slider."""
+        num_objects = controller.num_objects
+
+        self.class_power_panel = QFrame()
+        self.class_power_panel.setFrameShape(QFrame.Shape.StyledPanel)
+        self.class_power_panel.setFixedWidth(320)
+
+        panel_layout = QVBoxLayout(self.class_power_panel)
+        panel_layout.setContentsMargins(4, 4, 4, 4)
+        panel_layout.setSpacing(2)
+
+        # Title
+        title = QLabel('Class Power')
+        title.setStyleSheet('font-weight: bold;')
+        panel_layout.addWidget(title)
+
+        # Mode toggle: Multiply / Exponent
+        mode_row = QHBoxLayout()
+        self.power_mode_group = QButtonGroup(self)
+        self.power_mode_multiply = QRadioButton('Multiply')
+        self.power_mode_exponent = QRadioButton('Exponent')
+        self.power_mode_multiply.setChecked(True)
+        self.power_mode_group.addButton(self.power_mode_multiply)
+        self.power_mode_group.addButton(self.power_mode_exponent)
+        mode_row.addWidget(self.power_mode_multiply)
+        mode_row.addWidget(self.power_mode_exponent)
+        panel_layout.addLayout(mode_row)
+        self.power_mode_group.buttonClicked.connect(
+            lambda _btn: controller.on_class_power_mode_changed())
+
+        # Reset all button
+        self.power_reset_button = QPushButton('Reset All to 1.0')
+        self.power_reset_button.clicked.connect(controller.on_class_power_reset)
+        panel_layout.addWidget(self.power_reset_button)
+
+        # Scrollable area for class rows
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_widget = QWidget()
+        self._class_rows_layout = QVBoxLayout(scroll_widget)
+        self._class_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._class_rows_layout.setSpacing(2)
+
+        self._class_power_sliders: list[QSlider] = []
+        self._class_power_labels: list[QLabel] = []
+        self._class_name_buttons: list[QPushButton] = []
+
+        for obj_id in range(1, num_objects + 1):
+            row = QHBoxLayout()
+            row.setSpacing(4)
+
+            # color swatch
+            swatch = QLabel()
+            swatch.setFixedSize(16, 16)
+            r, g, b = custom_palette_np[obj_id]
+            swatch.setStyleSheet(
+                f'background-color: rgb({r},{g},{b}); border: 1px solid #888;')
+            row.addWidget(swatch)
+
+            # class name button (click to select this class)
+            name = custom_names.get(obj_id, f'Class {obj_id}')
+            btn = QPushButton(name)
+            btn.setFixedHeight(24)
+            btn.setMaximumWidth(90)
+            btn.setToolTip(f'Select class {obj_id}: {name}')
+            btn.setStyleSheet('text-align: left; padding: 1px 4px; font-size: 10px;')
+            btn.clicked.connect(functools.partial(controller.hit_number_key, obj_id))
+            self._class_name_buttons.append(btn)
+            row.addWidget(btn)
+
+            # power slider (range 10..1000, representing 0.1..10.0)
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setMinimum(10)
+            slider.setMaximum(1000)
+            slider.setValue(100)
+            slider.setMinimumWidth(50)
+            slider.setMinimumHeight(20)
+            slider.setToolTip('Class power weight (1.0 = neutral)')
+            slider.valueChanged.connect(
+                functools.partial(self._on_class_power_slider_changed, obj_id))
+            self._class_power_sliders.append(slider)
+            row.addWidget(slider, 1)
+
+            # numeric label showing the value
+            val_label = QLabel('1.00')
+            val_label.setFixedWidth(40)
+            val_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self._class_power_labels.append(val_label)
+            row.addWidget(val_label)
+
+            self._class_rows_layout.addLayout(row)
+
+        self._class_rows_layout.addStretch(1)
+        scroll.setWidget(scroll_widget)
+        panel_layout.addWidget(scroll, 1)
+
+    def _on_class_power_slider_changed(self, obj_id: int, value: int):
+        """Called when any class power slider moves."""
+        idx = obj_id - 1  # 0-based index into our lists
+        real_value = value / 100.0
+        self._class_power_labels[idx].setText(f'{real_value:.2f}')
+        self.controller.on_class_power_changed(obj_id, real_value)
+
+    def get_class_power_mode(self) -> str:
+        """Return 'multiply' or 'exponent'."""
+        if self.power_mode_exponent.isChecked():
+            return 'exponent'
+        return 'multiply'
+
+    def get_all_class_power_weights(self) -> list[float]:
+        """Return list of power weights for objects 1..N (background always 1.0)."""
+        return [s.value() / 100.0 for s in self._class_power_sliders]
+
+    def reset_class_power_sliders(self):
+        """Reset all sliders to 1.0."""
+        for slider in self._class_power_sliders:
+            slider.blockSignals(True)
+            slider.setValue(100)
+            slider.blockSignals(False)
+        for label in self._class_power_labels:
+            label.setText('1.00')
+
+    def highlight_selected_class(self, obj_id: int):
+        """Visually highlight the selected class row."""
+        for i, btn in enumerate(self._class_name_buttons):
+            if i + 1 == obj_id:
+                btn.setStyleSheet(
+                    'text-align: left; padding: 1px 4px; '
+                    'font-weight: bold; border: 2px solid #4488ff;')
+            else:
+                btn.setStyleSheet('text-align: left; padding: 1px 4px;')
 
     def update_global_memory_list(self, folders, current_video=''):
         """Refresh the global memory list with ``[(name, count), ...]``."""

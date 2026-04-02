@@ -21,6 +21,26 @@ def torch_prob_to_numpy_mask(prob: torch.Tensor):
     return mask
 
 
+def torch_prob_to_numpy_mask_weighted(prob: torch.Tensor,
+                                       weights: torch.Tensor,
+                                       mode: str = 'multiply') -> np.ndarray:
+    """Convert (C, H, W) probabilities to (H, W) index mask with per-class power weights.
+
+    Args:
+        prob: (num_objects+1, H, W) probability tensor.
+        weights: (num_objects+1,) tensor of per-class weights (index 0 = background).
+        mode: 'multiply' — ``prob * w``, or 'exponent' — ``prob ** w``.
+    """
+    w = weights.to(prob.device).view(-1, 1, 1)
+    if mode == 'exponent':
+        # clamp prob to avoid 0**negative
+        adjusted = prob.clamp(min=1e-7) ** w
+    else:
+        adjusted = prob * w
+    mask = torch.max(adjusted, dim=0).indices
+    return mask.cpu().numpy().astype(np.uint8)
+
+
 def index_numpy_to_one_hot_torch(mask: np.ndarray, num_classes: int):
     mask = torch.from_numpy(mask).long()
     return F.one_hot(mask, num_classes=num_classes).permute(2, 0, 1).float()
@@ -53,8 +73,11 @@ grayscale_weights_torch = torch.from_numpy(grayscale_weights).to(device).unsquee
 
 
 def get_visualization(mode: Literal['image', 'mask', 'fade', 'davis', 'light', 'popup', 'layer',
-                                    'rgba'], image: np.ndarray, mask: np.ndarray, layer: np.ndarray,
-                      target_objects: List[int]) -> np.ndarray:
+                                    'rgba', 'soft'],
+                      image: np.ndarray, mask: np.ndarray, layer: np.ndarray,
+                      target_objects: List[int],
+                      prob_np: np.ndarray = None,
+                      selected_obj: int = 1) -> np.ndarray:
     if mode == 'image':
         return image
     elif mode == 'mask':
@@ -75,13 +98,17 @@ def get_visualization(mode: Literal['image', 'mask', 'fade', 'davis', 'light', '
             return overlay_layer(image, mask, layer, target_objects)
     elif mode == 'rgba':
         return overlay_rgba(image, mask, target_objects)
+    elif mode == 'soft':
+        return overlay_soft(image, mask, prob_np, selected_obj)
     else:
         raise NotImplementedError
 
 
 def get_visualization_torch(mode: Literal['image', 'mask', 'fade', 'davis', 'light', 'popup',
-                                          'layer', 'rgba'], image: torch.Tensor, prob: torch.Tensor,
-                            layer: torch.Tensor, target_objects: List[int]) -> np.ndarray:
+                                          'layer', 'rgba', 'soft'],
+                            image: torch.Tensor, prob: torch.Tensor,
+                            layer: torch.Tensor, target_objects: List[int],
+                            selected_obj: int = 1) -> np.ndarray:
     if mode == 'image':
         return (image.permute(1, 2, 0) * 255).byte().cpu().numpy()
     elif mode == 'mask':
@@ -103,6 +130,8 @@ def get_visualization_torch(mode: Literal['image', 'mask', 'fade', 'davis', 'lig
             return overlay_layer_torch(image, prob, layer, target_objects)
     elif mode == 'rgba':
         return overlay_rgba_torch(image, prob, target_objects)
+    elif mode == 'soft':
+        return overlay_soft_torch(image, prob, selected_obj)
     else:
         raise NotImplementedError
 
@@ -292,3 +321,35 @@ def overlay_rgba_torch(image: torch.Tensor, prob: torch.Tensor, target_objects: 
     im_overlay = torch.cat([image, obj_mask], dim=-1).clip(0, 1)
     im_overlay = (im_overlay * 255).byte().cpu().numpy()
     return im_overlay
+
+
+def overlay_soft(image: np.ndarray, mask: np.ndarray, prob_np: np.ndarray,
+                 selected_obj: int) -> np.ndarray:
+    """Soft-mask overlay: tint the selected class using its probability as alpha.
+
+    Args:
+        image: (H, W, 3) uint8.
+        mask: (H, W) uint8 — unused, kept for API symmetry.
+        prob_np: (C, H, W) float32 probabilities, or None.
+        selected_obj: 1-based class index.
+    """
+    if prob_np is None or selected_obj < 1 or selected_obj >= prob_np.shape[0]:
+        return image.copy()
+    alpha = prob_np[selected_obj]  # (H, W) float in [0,1]
+    r, g, b = color_map_np[selected_obj]
+    tint = np.array([r, g, b], dtype=np.float32) / 255.0
+    img_f = image.astype(np.float32) / 255.0
+    blended = img_f * (1 - alpha[:, :, None] * 0.5) + tint[None, None, :] * alpha[:, :, None] * 0.5
+    return (blended.clip(0, 1) * 255).astype(np.uint8)
+
+
+def overlay_soft_torch(image: torch.Tensor, prob: torch.Tensor,
+                       selected_obj: int) -> np.ndarray:
+    """Soft-mask overlay (GPU path): tint the selected class using its probability."""
+    image = image.permute(1, 2, 0)  # (H, W, 3)
+    if selected_obj < 1 or selected_obj >= prob.shape[0]:
+        return (image * 255).byte().cpu().numpy()
+    alpha = prob[selected_obj].unsqueeze(2)  # (H, W, 1) soft probability
+    color = color_map_torch[selected_obj].view(1, 1, 3)  # class color
+    blended = image * (1 - alpha * 0.5) + color * alpha * 0.5
+    return (blended.clip(0, 1) * 255).byte().cpu().numpy()

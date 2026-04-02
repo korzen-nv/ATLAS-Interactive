@@ -124,6 +124,10 @@ class MainController():
         self.save_soft_mask: bool = False
         self.fill_gaps: bool = False
 
+        # class power weights: index 0 = background (always 1.0), 1..N = per-class
+        self.class_power_weights = torch.ones(self.num_objects + 1, dtype=torch.float)
+        self.class_power_mode: str = 'multiply'  # 'multiply' or 'exponent'
+
         self.interacted_prob: torch.Tensor = None
         self.overlay_layer: np.ndarray = None
         self.overlay_layer_torch: torch.Tensor = None
@@ -182,6 +186,7 @@ class MainController():
         # try to load the default overlay
         self._try_load_layer('./docs/uiuc.png')
         self.gui.set_object_color(self.curr_object)
+        self.gui.highlight_selected_class(self.curr_object)
         self.update_config()
 
     def _on_preload_progress(self):
@@ -211,6 +216,7 @@ class MainController():
         self.gui.text(f'Current object changed to {number}.')
         self.gui.set_object_color(number)
         self.gui.set_current_object_id(number)
+        self.gui.highlight_selected_class(number)
         self.show_current_frame()
     
     def on_mouse_motion_xy(self, x: int, y: int):
@@ -482,7 +488,12 @@ class MainController():
                 self.curr_mask.fill(0)
             else:
                 self.curr_mask = loaded_mask.copy()
-            self.curr_prob = None
+            # try to load saved soft probabilities; fall back to None (→ one-hot later)
+            soft = self.res_man.load_soft_mask(self.curr_ti, self.num_objects)
+            if soft is not None:
+                self.curr_prob = torch.from_numpy(soft).to(self.device)
+            else:
+                self.curr_prob = None
 
     def convert_current_image_mask_torch(self, no_mask: bool = False):
         if self.curr_image_torch is None:
@@ -493,8 +504,11 @@ class MainController():
                 self.device, non_blocking=True)
 
     def compose_current_im(self):
+        prob_np = self.curr_prob.cpu().numpy() if self.curr_prob is not None else None
         self.vis_image = get_visualization(self.vis_mode, self.curr_image_np, self.curr_mask,
-                                           self.overlay_layer, self.vis_target_objects)
+                                           self.overlay_layer, self.vis_target_objects,
+                                           prob_np=prob_np,
+                                           selected_obj=self.curr_object)
         if self._show_change_heatmap and self.curr_ti in self._change_heatmaps:
             self.vis_image = self._apply_change_heatmap(self.vis_image)
         if self._show_mask_diff:
@@ -525,7 +539,8 @@ class MainController():
         # do_no_save_soft_mask is an override to solve #41
         self.vis_image = get_visualization_torch(self.vis_mode, self.curr_image_torch,
                                                  self.curr_prob, self.overlay_layer_torch,
-                                                 self.vis_target_objects)
+                                                 self.vis_target_objects,
+                                                 selected_obj=self.curr_object)
         self.curr_image_torch = None
         self.vis_image = np.ascontiguousarray(self.vis_image)
         save_visualization = self.save_visualization_mode in [
@@ -640,7 +655,7 @@ class MainController():
                                                  self.curr_prob[1:],
                                                  idx_mask=False,
                                                  frame_idx=self.curr_ti)
-            self.curr_mask = torch_prob_to_numpy_mask(self.curr_prob)
+            self.curr_mask = self._prob_to_mask(self.curr_prob)
             if self.fill_gaps:
                 self.curr_mask = self.fill_mask_gaps(self.curr_mask)
             # clear
@@ -673,7 +688,7 @@ class MainController():
                                                      frame_idx=self.curr_ti)
                 if self.crf_enabled and _crf_available():
                     self.curr_prob = _apply_crf(self.curr_image_np, self.curr_prob)
-                self.curr_mask = torch_prob_to_numpy_mask(self.curr_prob)
+                self.curr_mask = self._prob_to_mask(self.curr_prob)
                 if self.fill_gaps:
                     self.curr_mask = self.fill_mask_gaps(self.curr_mask)
 
@@ -742,7 +757,7 @@ class MainController():
                                                       frame_idx=self.curr_ti)
                 if self.crf_enabled and _crf_available():
                     self.curr_prob = _apply_crf(self.curr_image_np, self.curr_prob)
-                self.curr_mask = torch_prob_to_numpy_mask(self.curr_prob)
+                self.curr_mask = self._prob_to_mask(self.curr_prob)
                 if self.fill_gaps:
                     self.curr_mask = self.fill_mask_gaps(self.curr_mask)
 
@@ -848,7 +863,7 @@ class MainController():
     def update_interacted_mask(self):
         self._snapshot_mask()
         self.curr_prob = self.interacted_prob
-        self.curr_mask = torch_prob_to_numpy_mask(self.interacted_prob)
+        self.curr_mask = self._prob_to_mask(self.interacted_prob)
         self.save_current_mask()
         self.show_current_frame()
         self.curr_frame_dirty = False
@@ -1464,6 +1479,57 @@ class MainController():
     def on_save_soft_mask_toggle(self):
         self.save_soft_mask = self.gui.save_soft_mask_checkbox.isChecked()
 
+    # ── Class Power callbacks ────────────────────────────────────────
+
+    def _has_non_default_class_power(self) -> bool:
+        """Return True if any class power weight differs from 1.0."""
+        return not torch.allclose(self.class_power_weights,
+                                  torch.ones_like(self.class_power_weights))
+
+    def _prob_to_mask(self, prob: torch.Tensor) -> np.ndarray:
+        """Central prob→mask conversion, applying class power when active."""
+        if self._has_non_default_class_power():
+            return torch_prob_to_numpy_mask_weighted(
+                prob, self.class_power_weights, self.class_power_mode)
+        return torch_prob_to_numpy_mask(prob)
+
+    def on_class_power_changed(self, obj_id: int, value: float):
+        """Called by GUI when a per-class power slider changes."""
+        self.class_power_weights[obj_id] = value
+        # auto-enable soft mask saving so probabilities survive frame navigation
+        if self._has_non_default_class_power() and not self.save_soft_mask:
+            self.save_soft_mask = True
+            self.gui.save_soft_mask_checkbox.setChecked(True)
+            self.gui.text('Soft mask saving auto-enabled for class power tuning.')
+        # live update: recompute mask from existing prob
+        if self.curr_prob is not None:
+            self.curr_mask = self._prob_to_mask(self.curr_prob)
+            if self.fill_gaps:
+                self.curr_mask = self.fill_mask_gaps(self.curr_mask)
+            self.save_current_mask()
+            self.show_current_frame()
+
+    def on_class_power_mode_changed(self):
+        """Called by GUI when multiply/exponent radio changes."""
+        self.class_power_mode = self.gui.get_class_power_mode()
+        if self._has_non_default_class_power() and self.curr_prob is not None:
+            self.curr_mask = self._prob_to_mask(self.curr_prob)
+            if self.fill_gaps:
+                self.curr_mask = self.fill_mask_gaps(self.curr_mask)
+            self.save_current_mask()
+            self.show_current_frame()
+
+    def on_class_power_reset(self):
+        """Reset all class power weights to 1.0."""
+        self.class_power_weights.fill_(1.0)
+        self.gui.reset_class_power_sliders()
+        if self.curr_prob is not None:
+            self.curr_mask = self._prob_to_mask(self.curr_prob)
+            if self.fill_gaps:
+                self.curr_mask = self.fill_mask_gaps(self.curr_mask)
+            self.save_current_mask()
+            self.show_current_frame()
+
     def on_fill_gaps_toggle(self):
         self.fill_gaps = self.gui.fill_gaps_checkbox.isChecked()
         state = 'ON' if self.fill_gaps else 'OFF'
@@ -1486,7 +1552,7 @@ class MainController():
         self._snapshot_mask()
         self.convert_current_image_mask_torch()
         self.curr_prob = _apply_crf(self.curr_image_np, self.curr_prob)
-        self.curr_mask = torch_prob_to_numpy_mask(self.curr_prob)
+        self.curr_mask = self._prob_to_mask(self.curr_prob)
         self.save_current_mask()
         self.show_current_frame()
         self.gui.text(f'CRF applied to frame {self.curr_ti}.')
