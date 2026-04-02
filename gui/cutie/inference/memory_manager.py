@@ -112,6 +112,14 @@ class MemoryManager:
 
         return value
 
+    def _get_visual_values_token_major_by_ids(self, obj_ids: List[int]) -> torch.Tensor:
+        value = torch.stack([self.work_mem.value_token_major[obj] for obj in obj_ids], dim=1)
+        if self.use_long_term and obj_ids[0] in self.long_mem.value_token_major:
+            lt_value = torch.stack([self.long_mem.value_token_major[obj] for obj in obj_ids], dim=1)
+            value = torch.cat([lt_value, value], dim=2)
+
+        return value
+
     def read(self, pix_feat: torch.Tensor, query_key: torch.Tensor, selection: torch.Tensor,
              last_mask: torch.Tensor, network: CUTIE,
              readout_fn=None,
@@ -205,9 +213,14 @@ class MemoryManager:
                 this_sensory = self._get_sensory_by_ids(objects)
                 this_last_mask = self._get_mask_by_ids(last_mask, objects)
                 this_msk_value = self._get_visual_values_by_ids(objects)  # (1/2)*num_objects*C*N
+                this_msk_value_t = self._get_visual_values_token_major_by_ids(objects)
                 with section('sparse_readout'):
                     visual_readout = sparse_readout(
-                        this_msk_value, topk_indices, topk_weights,
+                        this_msk_value,
+                        topk_indices,
+                        topk_weights,
+                        backend=self.readout_backend,
+                        v_token_major=this_msk_value_t,
                     ).view(bs, len(objects), self.CV, h, w)
 
                 this_obj_mem = self._get_object_mem_by_ids(objects)

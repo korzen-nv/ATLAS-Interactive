@@ -6,6 +6,7 @@ from gui.cutie.model.utils.memory_utils import (
     _chunked_topk_softmax_sparse,
     do_softmax_sparse,
     get_similarity,
+    sparse_readout,
     sparse_topk_affinity,
 )
 
@@ -65,6 +66,64 @@ class SparseTopkAffinityTest(unittest.TestCase):
                                          backend='triton')
 
         self._assert_sparse_close(reference, candidate, num_tokens=mk.flatten(start_dim=2).shape[-1])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton path")
+    def test_triton_affinity_matches_dense_on_cuda(self) -> None:
+        torch.manual_seed(2)
+        mk = torch.randn(1, 8, 53, device='cuda', dtype=torch.float16)
+        ms = torch.rand(1, 1, 53, device='cuda', dtype=torch.float16) + 1.0
+        qk = torch.randn(1, 8, 17, device='cuda', dtype=torch.float16)
+        qe = torch.sigmoid(torch.randn(1, 8, 17, device='cuda', dtype=torch.float16))
+        top_k = 7
+
+        similarity = get_similarity(mk.float(), ms.float(), qk.float(), qe.float())
+        reference = do_softmax_sparse(similarity, top_k=top_k, return_usage=True)
+        candidate = sparse_topk_affinity(mk,
+                                         ms,
+                                         qk,
+                                         qe,
+                                         top_k=top_k,
+                                         return_usage=True,
+                                         backend='triton')
+
+        ref_dense = _dense_from_sparse(reference[0], reference[1], mk.shape[-1])
+        cand_dense = _dense_from_sparse(candidate[0], candidate[1], mk.shape[-1])
+        torch.testing.assert_close(cand_dense, ref_dense, atol=2e-4, rtol=2e-4)
+        torch.testing.assert_close(candidate[2], reference[2], atol=2e-4, rtol=2e-4)
+
+
+class SparseReadoutTest(unittest.TestCase):
+    def test_sparse_readout_matches_dense_cpu(self) -> None:
+        torch.manual_seed(3)
+        value = torch.randn(1, 3, 5, 19)
+        topk_indices = torch.randint(0, 19, (1, 4, 11))
+        topk_weights = torch.softmax(torch.randn(1, 4, 11), dim=1)
+
+        expected = sparse_readout(value, topk_indices, topk_weights, backend='pytorch')
+        actual = sparse_readout(value,
+                                topk_indices,
+                                topk_weights,
+                                backend='auto',
+                                v_token_major=value.permute(0, 1, 3, 2).contiguous())
+
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton path")
+    def test_triton_sparse_readout_matches_pytorch(self) -> None:
+        torch.manual_seed(4)
+        value = torch.randn(1, 4, 6, 23, device='cuda', dtype=torch.float16)
+        topk_indices = torch.randint(0, 23, (1, 5, 13), device='cuda')
+        topk_weights = torch.softmax(torch.randn(1, 5, 13, device='cuda'), dim=1)
+        value_token_major = value.permute(0, 1, 3, 2).contiguous()
+
+        expected = sparse_readout(value, topk_indices, topk_weights, backend='pytorch')
+        actual = sparse_readout(value,
+                                topk_indices,
+                                topk_weights,
+                                backend='triton',
+                                v_token_major=value_token_major)
+
+        torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
 
 if __name__ == '__main__':
