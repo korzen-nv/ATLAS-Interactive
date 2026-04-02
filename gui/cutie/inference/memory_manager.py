@@ -174,6 +174,7 @@ class MemoryManager:
                         query_key,
                         selection,
                         top_k=self.top_k,
+                        profiler=profiler,
                         return_usage=True,
                         backend=self.readout_backend,
                     )
@@ -199,6 +200,7 @@ class MemoryManager:
                             query_key,
                             selection,
                             top_k=self.top_k,
+                            profiler=profiler,
                             return_usage=True,
                             backend=self.readout_backend,
                         )
@@ -210,6 +212,7 @@ class MemoryManager:
                             query_key,
                             selection,
                             top_k=self.top_k,
+                            profiler=profiler,
                             backend=self.readout_backend,
                         )
 

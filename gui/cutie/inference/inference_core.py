@@ -297,6 +297,7 @@ class InferenceCore:
                     ms_features[2],   # f4
                     memory_readout,
                     current_sensory,
+                    profiler=self.profiler,
                 )
             # Post-processing (same as CUTIE.segment)
             with self.profiler.section('trt_mask_postprocess'):

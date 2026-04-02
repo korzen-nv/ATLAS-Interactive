@@ -3,78 +3,75 @@
 Video: `cmr-hd/episode_000001.mp4` (3600 frames, 1080p source)  
 GPU: Blackwell (RTX PRO 6000), PyTorch 2.11 + CUDA 13.0, TensorRT 10.15, AMP FP16
 
-## Current state: affinity fixed, propagation staging largely fixed
+## Current state: active-object reduction landed, propagation cleanup is now secondary
 
-### Latest inference-core profiler (steady-state average from a 25s run, first 50-frame block ignored)
+This workspace starts from only 7 non-empty object channels even though the GUI config allows 19 objects. CUTIE now tracks only the active objects internally, resolves an exact-object-count TRT mask decoder when possible, and expands the result back to canonical class channels for the GUI/controller. That kept the large speedup while fixing the earlier class-ID mix-up and restart crash.
+
+### Latest inference-core profiler (steady-state 50-frame block after warmup)
 
 Command used:
 
-`uv run gui.py --video ../ATLAS-Interactive/data/cmr-hd/episode_000001.mp4 --internal-size 1080 --profile --auto-propagate-forward --auto-pause-after 25`
+`uv run gui.py --video ../ATLAS-Interactive/data/cmr-hd/episode_000001.mp4 --internal-size 1080 --profile`
+
+Most recent steady-state block:
 
 | Stage | Component | ms/frame | % | Optimization |
 |-------|-----------|----------|---|--------------|
-| Encoder | pixel_encoder + pix_feat_proj + key_proj | 1.70 | 2.4% | **TRT engine** (FP16, static shapes) |
-| Memory readout | affinity + sparse_readout + pixel_fusion + object_transformer | 33.56 | 46.8% | Triton sparse readout + Triton local-topk affinity + SDPA path |
-| Mask decoder | decoder_feat_proc + upsample + predict + sensory GRU | 23.74 | 33.1% | **TRT engine** (FP16, static shapes, NO=19) |
-| Add memory | encode_mask (ResNet18) + memory store | 12.67 | 17.7% | PyTorch |
-| **Total** | | **71.75** | | **13.9 FPS** |
+| Encoder | pixel_encoder + pix_feat_proj + key_proj | 1.79 | 7.2% | **TRT encoder** (FP16, static shapes) |
+| Memory readout | affinity + sparse_readout + pixel_fusion + object_transformer | 12.86 | 51.5% | Active-object path + Triton sparse readout + Triton local-topk affinity + SDPA path |
+| Mask decoder | decoder_feat_proc + upsample + predict + sensory GRU | 7.62 | 30.5% | **TRT decoder** on the reduced active-object path |
+| Add memory | encode_mask (ResNet18) + memory store | 2.71 | 10.8% | Active-object path + channels-last / AMP cleanups |
+| **Total** | | **24.98** | | **40.0 FPS model-only steady-state** |
 
-Steady-state blocks used for the averages above:
+Latest whole-run headline from the same profile pass:
 
-- Block 1: `TOTAL 71.47`, `affinity_topk 7.18`, `sparse_readout 1.55`
-- Block 2: `TOTAL 71.10`, `affinity_topk 7.18`, `sparse_readout 1.55`
-- Block 3: `TOTAL 71.72`, `affinity_topk 7.20`, `sparse_readout 1.63`
-- Block 4: `TOTAL 71.96`, `affinity_topk 7.28`, `sparse_readout 1.60`
-- Block 5: `TOTAL 72.52`, `affinity_topk 7.39`, `sparse_readout 1.56`
+- `Propagated 418 frames in 18.5s (22.6 fps, 44.2 ms/frame)`
+
+Important caveat: the whole-run number still includes startup, warmup, and the slow first block. The steady-state hot loop is materially faster than the headline FPS suggests.
 
 ### Averaged step-profiler output
 
 | Span | ms/frame |
 |------|----------|
-| `start → encode` | 0.07 |
+| `start → encode` | 0.09 |
 | `encode → segment` | 1.70 |
 | `segment → mem_read` | 0.00 |
-| `mem_read → mask_decode` | 33.56 |
-| `mask_decode → add_mem` | 23.74 |
-| `add_mem → resize_up` | 12.67 |
+| `mem_read → mask_decode` | 12.86 |
+| `mask_decode → add_mem` | 7.62 |
+| `add_mem → resize_up` | 2.71 |
 | `resize_up → done` | 0.00 |
-| `TOTAL (start → done)` | 71.75 |
+| `TOTAL (start → done)` | 24.98 |
 
 ### Detailed readout breakdown (steady-state, from `--profile`)
 
 | Sub-stage | ms/frame | Notes |
 |----------|----------|-------|
-| `affinity_topk` | 7.25 | Major win from Triton local top-k using `tl.topk`; still not the final fully fused kernel |
-| `sparse_readout` | 1.58 | Solved enough; token-major cache + Triton gather/reduction removed this as a first-class bottleneck |
-| `object_transformer` | 13.60 | Still meaningful, but now clearly behind affinity |
-| `pixel_fusion` | 5.64 | Secondary cost |
-| `aux_mask` | 0.39 | Negligible |
+| `affinity_candidate_build` | 4.64 | Largest remaining affinity slice; currently the main model-side target inside readout |
+| `affinity_select_topk` | 1.79 | Second affinity slice; global select/merge over block candidates |
+| `affinity_softmax` | 0.04 | Negligible |
+| `affinity_usage` | 0.01 | Negligible |
+| `sparse_readout` | 0.39 | No longer a serious bottleneck |
+| `object_transformer` | 3.56 | Meaningfully smaller after the layout and active-object reductions |
+| `pixel_fusion` | 1.39 | Secondary cost |
+| `aux_mask` | 0.32 | Negligible |
 
-### Propagation wall-clock profile after preload-aware direct prefetch (display enabled, same 25s run, first 50-frame block ignored)
+### Propagation wall-clock profile (same recent steady-state block)
 
-This is the missing piece behind the user-visible propagation number. The latest run waits for preload completion before auto-start, bypasses multiprocess `DataLoader` when frames are already cached in RAM, stages a small pinned host window, and moves permutation/normalization onto the GPU. The propagation wall profiler shows that display is still not the issue, and that frame staging is much smaller than before.
-
-Steady-state propagation wall blocks used for the averages below:
-
-- Block 1: `loader_wait 3.71`, `frame_upload 0.02`, `pending_total 3.76`
-- Block 2: `loader_wait 3.90`, `frame_upload 0.02`, `pending_total 3.67`
-- Block 3: `loader_wait 3.85`, `frame_upload 0.02`, `pending_total 3.69`
-- Block 4: `loader_wait 3.68`, `frame_upload 0.02`, `pending_total 3.54`
-- Block 5: `loader_wait 3.78`, `frame_upload 0.02`, `pending_total 3.71`
+The propagation path is no longer the primary problem. Preload-aware staging and latest-only preview flushing already removed most of the old wall-time tax, and the recent GPU-side `uint8` narrowing of hard masks cut the old `pending_mask_to_numpy` cost by roughly 4x.
 
 | Propagation wall stage | ms/frame | Notes |
 |------------------------|----------|-------|
-| `loader_wait` | 3.78 | Main-process RAM-cache fetch plus prefetch bookkeeping |
-| `frame_upload` | 0.02 | H2D upload moved almost entirely off the hot path via pinned-memory prefetch |
-| `pending_mask_to_numpy` | 2.67 | `torch.max(...).cpu().numpy()` for the previous frame |
-| `pending_save_mask` | 0.23 | Queueing PNG mask writes is still small in steady state |
-| `pending_display_frame` | 0.10 | Display cost remains tiny on average because the default throttle only shows every 16th frame |
-| `pending_process_events` | 0.26 | Qt event processing is not a major cost |
-| `pending_total` | 3.67 | All post-inference previous-frame handling combined |
+| `loader_wait` | 4.03 | Main-process RAM-cache fetch plus prefetch bookkeeping |
+| `frame_upload` | 0.02 | H2D upload remains effectively off the hot path |
+| `step_dispatch` | 25.17 | Closely tracks the CUDA step-profiler total when `--profile` is enabled |
+| `pending_mask_to_numpy` | 0.63 | Formerly ~2.7-3.5 ms; now much smaller after narrowing to `uint8` on GPU before D2H |
+| `pending_save_mask` | 0.79 | Now one of the bigger non-model steady-state items |
+| `pending_display_frame` | 0.23 | Preview remains small with the default throttle |
+| `pending_update_memory_gauges` | 0.48 | Small but visible now that mask materialization is cheaper |
+| `pending_process_events` | 0.88 | Qt event processing is still secondary |
+| `pending_total` | 3.03 | All post-inference previous-frame handling combined |
 
-Important note: with `--profile`, `InferenceCore.profiler.finish_frame()` calls `torch.cuda.synchronize()` every frame, so `step_dispatch` in the propagation wall profiler closely matches the CUDA step-profiler total. Even with that caveat, the relative gain is clear: `loader_wait + frame_upload` dropped from about `13.0 ms/frame` to about `3.8 ms/frame`, while display and save/UI work remain negligible.
-
-### Latest-only preview validation
+### Latest-only preview validation (historical no-skip check)
 
 A second pass changed propagation preview from frame-count-driven paint calls to latest-only, time-based preview flushing. I also added `--display-skip` to make skip/no-skip runs reproducible from the command line.
 
@@ -94,31 +91,31 @@ Steady-state no-skip wall profile:
 | `pending_process_events` | 2.64 | Bounded event-pump cost for the live preview path |
 | `pending_total` | 7.67 | No-skip preview/UI overhead is now bounded rather than per-frame paint driven |
 
-This means the old no-skip penalty has been reduced, but not eliminated. The next propagation-side target is still `pending_mask_to_numpy`, followed by further simplification of no-skip UI updates if that mode matters.
+This no-skip validation was captured before the later GPU-side `uint8` hard-mask narrowing, so the absolute `pending_mask_to_numpy` number is now lower in the default path. The main point still holds: no-skip preview has a real bounded UI cost, but the default throttled propagation path is now model-dominated.
 
 ### Improvement over baseline at 1080p
 
 | Stage | Baseline | Current | Speedup |
 |-------|---------|---------|---------|
-| Encoder | ~25 ms | 1.73 ms (TRT) | **14.5x** |
-| Memory readout | ~71 ms | 33.56 ms | **2.12x** |
-| Mask decoder | ~55 ms | 23.74 ms (TRT) | **2.32x** |
-| Add memory | ~12 ms | ~12.67 ms | — |
-| **Total** | **163 ms (6.1 FPS)** | **71.75 ms (13.9 FPS)** | **2.27x** |
+| Encoder | ~25 ms | 1.79 ms (TRT) | **14.0x** |
+| Memory readout | ~71 ms | 12.86 ms | **5.52x** |
+| Mask decoder | ~55 ms | 7.62 ms (TRT active-object path) | **7.22x** |
+| Add memory | ~12 ms | 2.71 ms | **4.43x** |
+| **Total** | **163 ms (6.1 FPS)** | **24.98 ms (40.0 FPS model-only steady-state)** | **6.52x** |
 
-### Improvement over previous optimized state
+### Improvement over the previous 71.75 ms state
 
-Previous state here means: TRT encoder + TRT mask decoder + Triton sparse readout + older affinity kernel path before the `tl.topk` local selector.
+Previous state here means the earlier optimized path documented in this file: TRT encoder + TRT decoder + Triton sparse readout + Triton local-topk affinity, but still tracking the full configured object set internally.
 
 | Metric | Previous | Current | Change |
 |--------|----------|---------|--------|
-| `affinity_topk` | 26.75 ms | 7.25 ms | **3.69x faster** |
-| `sparse_readout` | 1.47 ms | 1.58 ms | Same |
-| `object_transformer` | 13.02 ms | 13.60 ms | Same tier |
-| `pixel_fusion` | 5.38 ms | 5.64 ms | Same tier |
-| `aux_mask` | 0.38 ms | 0.39 ms | Same |
-| `mem_read → mask_decode` | 51.89 ms | 33.56 ms | **1.55x faster** |
-| **Total** | **88.71 ms (11.3 FPS)** | **71.75 ms (13.9 FPS)** | **1.24x faster** |
+| `mem_read → mask_decode` | 33.56 ms | 12.86 ms | **2.61x faster** |
+| `mask_decode → add_mem` | 23.74 ms | 7.62 ms | **3.12x faster** |
+| `add_mem → resize_up` | 12.67 ms | 2.71 ms | **4.67x faster** |
+| `object_transformer` | 13.60 ms | 3.56 ms | **3.82x faster** |
+| `pixel_fusion` | 5.64 ms | 1.39 ms | **4.06x faster** |
+| `pending_mask_to_numpy` | 2.67 ms | 0.63 ms | **4.24x faster** |
+| **`TOTAL (start → done)`** | **71.75 ms** | **24.98 ms** | **2.87x faster** |
 
 ## TensorRT engines
 
@@ -130,11 +127,13 @@ Two native TRT engines built at startup (ONNX export + TRT autotuner), cached to
 - 7 outputs: f16, f8, f4, pix_feat, key, shrinkage, selection
 - Conv-BN-ReLU fusion, FP16 kernels throughout
 
-**Mask decoder engine** (`TRTMaskDecoder`):
+**Mask decoder engine** (`TRTMaskDecoderManager` + `TRTMaskDecoder`):
 - Combines: DecoderFeatureProcessor + MaskUpsampleBlock (x2) + prediction Conv + SensoryUpdater GRU
-- Inputs: f8_raw, f4_raw, memory_readout, sensory (fixed `num_objects` from config)
+- Manager lazily loads or builds exact-object-count decoder engines and keeps a larger fallback engine
+- Inputs: f8_raw, f4_raw, memory_readout, sensory
 - 2 outputs: new_sensory, logits
-- Handles fewer active objects via zero-padding + output slicing
+- Current workspace runs on the reduced active-object path (7 active objects in steady state)
+- Falls back to zero-padding + output slicing only when no exact engine is available
 - Uses avg_pool2d instead of `F.interpolate(mode='area')` for ONNX compatibility
 - 8 GB TRT workspace required for 1080p x 19 objects
 
@@ -142,9 +141,13 @@ Two native TRT engines built at startup (ONNX export + TRT autotuner), cached to
 
 - **Sparse readout fast path**: `sparse_readout` now has a Triton gather/reduction kernel, and memory values are also cached in token-major layout at insert time. In steady-state profiling this dropped `sparse_readout` from `15.23 ms` to `1.47 ms`.
 - **Affinity fast path**: `sparse_topk_affinity` now uses a real Triton kernel for the block-local similarity scan and local top-k on CUDA, then does a small global merge in PyTorch. Replacing the local repeated max/argmax loop with Triton `tl.topk` dropped `affinity_topk` from `26.75 ms` to `6.96 ms` in the step profiler.
-- **Transformer fast path**: query transformer attention now uses PyTorch SDPA with a broadcast additive mask instead of per-head mask replication.
+- **Active-object inference path**: non-empty probability-mask channels are now inferred up front, CUTIE keeps only those objects internally, and the backend remaps sparse internal outputs back to canonical GUI class channels. This is the main reason the current workspace dropped from the earlier `71.75 ms` state to `24.98 ms` steady-state model time.
+- **Dynamic TRT decoder selection**: the mask decoder path now resolves an exact-object-count TRT engine when possible instead of always paying for the configured 19-object engine.
+- **Transformer fast path**: query transformer attention now uses PyTorch SDPA with a broadcast additive mask instead of per-head mask replication, the SDPA head split no longer forces an extra contiguous copy, and the PixelFFN path avoids an unnecessary channels-last round-trip.
+- **Mask/add-memory cleanup**: `MaskEncoder` now runs channels-last, sensory updaters only force FP32 for the recurrent update, and exact-ratio downsampling takes an `avg_pool2d` fast path.
+- **Propagation-side mask materialization**: hard masks are now narrowed to `uint8` on GPU before the D2H copy, cutting `pending_mask_to_numpy` from roughly `2.7-3.5 ms` to about `0.6-0.8 ms` in steady state.
 - **Cached positional encoding**: spatial PE is cached by shape/layout instead of batch/object count.
-- **Propagation wall profiler**: `--profile` now also prints wall-clock propagation timings (`loader_wait`, `frame_upload`, `pending_mask_to_numpy`, `pending_display_frame`, etc.) so user-visible propagation FPS can be separated from model-only timings.
+- **Profiler detail**: `--profile` now also prints wall-clock propagation timings and finer model splits (`affinity_candidate_build`, `affinity_select_topk`, and later sub-slices for affinity / TRT decoder work) so the next bottleneck can be chosen from measurements instead of guesses.
 
 ## TRT readout (pixel_fuser + object_transformer) — investigated, not viable
 
@@ -189,23 +192,23 @@ Historical detailed readout breakdown:
 
 ## Findings
 
-1. **The affinity optimization is still holding.** `affinity_topk` is now about `7.25 ms/frame`, down from `26.75 ms/frame` before the Triton `tl.topk` selector landed.
-2. **The propagation staging optimization landed too.** `loader_wait + frame_upload` fell from about `13.0 ms/frame` to about `3.8 ms/frame` after waiting for preload completion, bypassing multiprocess `DataLoader` for preloaded frames, and using pinned-memory async H2D.
-3. **Display is still not the problem.** `pending_display_frame` remains about `0.10 ms/frame`, and `pending_process_events` remains small.
-4. **The current non-inference remainder is small and mostly CPU mask materialization.** `pending_mask_to_numpy` is now the largest propagation-side non-model item at about `2.67 ms/frame`.
-5. **Within the model, readout is no longer catastrophic but still largest.** `mem_read → mask_decode` is about `33.56 ms/frame`.
-6. **The next model-side tier is now clearer.** `object_transformer` (`13.60 ms/frame`) and add-memory (`12.67 ms/frame`) are the main remaining heavy stages after affinity.
-7. **Encoder TRT and mask-decoder TRT remain solid wins.** No reason to revisit them before the next propagation or model bottleneck is chosen.
+1. **The active-object path is the biggest recent win.** On this workspace, reducing the internal path from the configured 19 objects to the 7 actually active ones cut steady-state model time from `71.75 ms` to `24.98 ms`.
+2. **Propagation-side cleanup is now secondary.** `pending_mask_to_numpy` is only about `0.63 ms/frame`, and the whole pending block is about `3.03 ms/frame`.
+3. **Readout is still the largest model stage.** `mem_read → mask_decode` is `12.86 ms/frame`, with `affinity_candidate_build` (`4.64 ms`) and `affinity_select_topk` (`1.79 ms`) now the clearest sub-targets.
+4. **TRT mask decode is still the next single heavy kernel.** `trt_mask_decode` is `7.44 ms/frame`, much lower than before but still the biggest non-affinity item.
+5. **Encoder and add-memory are no longer first-order problems.** The encoder is about `1.79 ms/frame`, and the full add-memory span is about `2.71 ms/frame`.
+6. **Display is not the limiter in the default path.** `pending_display_frame`, gauge updates, and Qt event processing are all well below the model cost.
+7. **The remaining work should be measurement-driven.** The next useful splits are inside `affinity_candidate_build` and `trt_mask_decode`, not another broad optimization guess.
 
 ## What would help next
 
-1. **If propagation wall time is still the priority, attack mask materialization next**: `pending_mask_to_numpy` (`torch.max(...).cpu().numpy()`) is now the biggest non-model propagation-side item.
-2. **Consider a latest-only preview path or true headless propagation mode**: display is already cheap, but removing preview/state updates from the hot loop would simplify the propagation path further.
-3. **After that, go back to model bottlenecks**: `object_transformer`, add-memory, and any remaining global-merge cost inside affinity are now the main candidates.
+1. **Split and tune affinity further**: the next pass should use the newer profiler slices to decide whether `affinity_query_precompute` or the Triton kernel itself is the real `affinity_candidate_build` cost.
+2. **Split and tune TRT decode further**: the next pass should separate TRT execute time from pad/input-prep/output-allocation/bind overhead inside `trt_mask_decode`.
+3. **If user-visible propagation FPS matters after that, look at `loader_wait` and `pending_save_mask`**: those are now larger than `pending_mask_to_numpy` in the default path.
 4. **Config tuning remains available**: `top_k` (`30→16`), `max_num_tokens` (`10000→5000`), `mem_every` (`5→8` or `10`) still trade quality for speed.
-5. **TRT for encode_mask**: still potentially useful, but not the most urgent issue.
+5. **TRT for encode_mask**: still potentially useful, but it is no longer the obvious next bottleneck.
 6. **Future TRT versions**: retry the readout engine. The wrapper code is ready, but TRT 10.15 still produces incorrect output.
-7. **Lower resolution**: `--internal-size 720` remains the simplest way to move toward ~20 FPS.
+7. **Lower resolution**: `--internal-size 720` remains the simplest coarse knob if absolute FPS matters more than quality.
 
 ## Scaling behavior
 
@@ -213,6 +216,6 @@ Historical detailed readout breakdown:
 |---------------|---------|---------|-----|
 | 480 | 41.7 ms | ~25 ms | ~40 |
 | 720 | 74.7 ms | ~50 ms (est) | ~20 |
-| 1080 | 162.8 ms | 71.75 ms (model-only) | 13.9 |
+| 1080 | 162.8 ms | 24.98 ms (model-only steady-state, active-object path) | 40.0 model-only |
 
-Note: the latest propagation-side profiling shows that frame staging is much smaller than before. The remaining gap over model-only timings is now mostly `pending_mask_to_numpy`, not display rendering.
+Note: the current whole-run propagation headline is still lower than the steady-state model FPS because startup, warmup, and the first slow block are included. In the default steady-state path, the remaining wall-time gap over model-only execution is now dominated by `loader_wait`, `pending_save_mask`, and other small CPU-side tasks rather than display rendering.
