@@ -1,4 +1,5 @@
 import math
+from contextlib import nullcontext
 from typing import Optional, Union, Tuple
 
 import torch
@@ -546,8 +547,10 @@ def _chunked_topk_softmax_sparse(
     qk: torch.Tensor,
     qe: Optional[torch.Tensor],
     top_k: int,
+    profiler=None,
     return_usage: bool = False,
 ) -> tuple:
+    section = profiler.section if profiler is not None else nullcontext
     mk = mk.flatten(start_dim=2)
     qk = qk.flatten(start_dim=2)
     qe = qe.flatten(start_dim=2) if qe is not None else None
@@ -561,9 +564,10 @@ def _chunked_topk_softmax_sparse(
 
     qk_float = qk.float()
     if qe is not None:
-        qe_float = qe.float()
-        qk_weighted = (qk * qe).float()
-        b_sq = (qe * qk.square()).float().sum(1, keepdim=False)
+        with section('affinity_query_precompute'):
+            qe_float = qe.float()
+            qk_weighted = (qk * qe).float()
+            b_sq = (qe * qk.square()).float().sum(1, keepdim=False)
     else:
         qe_float = None
         qk_weighted = None
@@ -571,43 +575,46 @@ def _chunked_topk_softmax_sparse(
 
     topk_values = None
     topk_indices = None
-    for start in range(0, num_tokens, chunk_size):
-        end = min(start + chunk_size, num_tokens)
-        mk_chunk = mk[:, :, start:end].float()
-        if qe_float is not None:
-            mk_t = mk_chunk.transpose(1, 2)
-            sim_chunk = -(mk_t.square() @ qe_float)
-            sim_chunk += 2 * (mk_t @ qk_weighted)
-            sim_chunk -= b_sq.unsqueeze(1)
-        else:
-            mk_t = mk_chunk.transpose(1, 2)
-            sim_chunk = -mk_chunk.square().sum(1, keepdim=False).unsqueeze(2)
-            sim_chunk = sim_chunk + 2 * (mk_t @ qk_float)
+    with section('affinity_candidate_build'):
+        for start in range(0, num_tokens, chunk_size):
+            end = min(start + chunk_size, num_tokens)
+            mk_chunk = mk[:, :, start:end].float()
+            if qe_float is not None:
+                mk_t = mk_chunk.transpose(1, 2)
+                sim_chunk = -(mk_t.square() @ qe_float)
+                sim_chunk += 2 * (mk_t @ qk_weighted)
+                sim_chunk -= b_sq.unsqueeze(1)
+            else:
+                mk_t = mk_chunk.transpose(1, 2)
+                sim_chunk = -mk_chunk.square().sum(1, keepdim=False).unsqueeze(2)
+                sim_chunk = sim_chunk + 2 * (mk_t @ qk_float)
 
-        if ms is not None:
-            sim_chunk *= ms[:, start:end].float()
-        sim_chunk *= scale
+            if ms is not None:
+                sim_chunk *= ms[:, start:end].float()
+            sim_chunk *= scale
 
-        chunk_k = min(top_k, end - start)
-        chunk_values, local_indices = torch.topk(sim_chunk, k=chunk_k, dim=1)
-        token_indices = torch.arange(start,
-                                     end,
-                                     device=mk.device,
-                                     dtype=torch.long).view(1, -1, 1).expand(bs, -1, hw)
-        chunk_indices = token_indices.gather(1, local_indices)
-        topk_values, topk_indices = _merge_topk(topk_values,
-                                                topk_indices,
-                                                chunk_values,
-                                                chunk_indices,
-                                                top_k)
+            chunk_k = min(top_k, end - start)
+            chunk_values, local_indices = torch.topk(sim_chunk, k=chunk_k, dim=1)
+            token_indices = torch.arange(start,
+                                         end,
+                                         device=mk.device,
+                                         dtype=torch.long).view(1, -1, 1).expand(bs, -1, hw)
+            chunk_indices = token_indices.gather(1, local_indices)
+            topk_values, topk_indices = _merge_topk(topk_values,
+                                                    topk_indices,
+                                                    chunk_values,
+                                                    chunk_indices,
+                                                    top_k)
 
-    maxes = topk_values.max(dim=1, keepdim=True).values
-    topk_weights = torch.exp(topk_values - maxes)
-    topk_weights /= torch.sum(topk_weights, dim=1, keepdim=True)
+    with section('affinity_softmax'):
+        maxes = topk_values.max(dim=1, keepdim=True).values
+        topk_weights = torch.exp(topk_values - maxes)
+        topk_weights /= torch.sum(topk_weights, dim=1, keepdim=True)
 
     if return_usage:
-        usage = torch.zeros(bs, num_tokens, device=mk.device, dtype=topk_weights.dtype)
-        usage.scatter_add_(1, topk_indices.reshape(bs, -1), topk_weights.reshape(bs, -1))
+        with section('affinity_usage'):
+            usage = torch.zeros(bs, num_tokens, device=mk.device, dtype=topk_weights.dtype)
+            usage.scatter_add_(1, topk_indices.reshape(bs, -1), topk_weights.reshape(bs, -1))
         return topk_weights, topk_indices, usage
     return topk_weights, topk_indices
 
@@ -618,8 +625,10 @@ def _triton_topk_affinity(
     qk: torch.Tensor,
     qe: Optional[torch.Tensor],
     top_k: int,
+    profiler=None,
     return_usage: bool = False,
 ) -> tuple:
+    section = profiler.section if profiler is not None else nullcontext
     mk = mk.flatten(start_dim=2).contiguous()
     qk = qk.flatten(start_dim=2).contiguous()
     qe = qe.flatten(start_dim=2).contiguous() if qe is not None else None
@@ -642,90 +651,98 @@ def _triton_topk_affinity(
     block_indices = torch.empty((bs, hw, num_blocks, topk_pad), device=mk.device, dtype=torch.int32)
     grid = lambda meta: (triton.cdiv(hw, meta["BLOCK_HW"]), num_blocks, bs)
 
-    if qe is not None:
-        qk_weighted = (qk * qe).contiguous()
-        b_sq = (qe * qk.square()).sum(1).contiguous()
-        _sparse_topk_affinity_qe_kernel[grid](
-            mk,
-            ms if ms is not None else mk.new_empty((bs, 1)),
-            qe,
-            qk_weighted,
-            b_sq,
-            block_values,
-            block_indices,
-            mk.stride(0),
-            mk.stride(1),
-            mk.stride(2),
-            ms.stride(0) if ms is not None else 0,
-            ms.stride(1) if ms is not None else 0,
-            qe.stride(0),
-            qe.stride(1),
-            qe.stride(2),
-            qk_weighted.stride(0),
-            qk_weighted.stride(1),
-            qk_weighted.stride(2),
-            b_sq.stride(0),
-            b_sq.stride(1),
-            block_values.stride(0),
-            block_values.stride(2),
-            block_values.stride(3),
-            block_values.stride(1),
-            block_indices.stride(0),
-            block_indices.stride(2),
-            block_indices.stride(3),
-            block_indices.stride(1),
-            num_tokens,
-            hw,
-            ck,
-            scale,
-            HAS_MS=ms is not None,
-            TOPK_PAD=topk_pad,
-        )
-    else:
-        _sparse_topk_affinity_no_qe_kernel[grid](
-            mk,
-            ms if ms is not None else mk.new_empty((bs, 1)),
-            qk,
-            block_values,
-            block_indices,
-            mk.stride(0),
-            mk.stride(1),
-            mk.stride(2),
-            ms.stride(0) if ms is not None else 0,
-            ms.stride(1) if ms is not None else 0,
-            qk.stride(0),
-            qk.stride(1),
-            qk.stride(2),
-            block_values.stride(0),
-            block_values.stride(2),
-            block_values.stride(3),
-            block_values.stride(1),
-            block_indices.stride(0),
-            block_indices.stride(2),
-            block_indices.stride(3),
-            block_indices.stride(1),
-            num_tokens,
-            hw,
-            ck,
-            scale,
-            HAS_MS=ms is not None,
-            TOPK_PAD=topk_pad,
-        )
+    with section('affinity_candidate_build'):
+        if qe is not None:
+            with section('affinity_query_precompute'):
+                qk_weighted = (qk * qe).contiguous()
+                b_sq = (qe * qk.square()).sum(1).contiguous()
 
-    candidate_values = block_values.reshape(bs, hw, num_blocks * topk_pad)
-    candidate_indices = block_indices.reshape(bs, hw, num_blocks * topk_pad).to(torch.long)
-    topk_values_hw, order = torch.topk(candidate_values, k=top_k, dim=2)
-    indices_hw = candidate_indices.gather(2, order)
+            with section('affinity_triton_kernel'):
+                _sparse_topk_affinity_qe_kernel[grid](
+                    mk,
+                    ms if ms is not None else mk.new_empty((bs, 1)),
+                    qe,
+                    qk_weighted,
+                    b_sq,
+                    block_values,
+                    block_indices,
+                    mk.stride(0),
+                    mk.stride(1),
+                    mk.stride(2),
+                    ms.stride(0) if ms is not None else 0,
+                    ms.stride(1) if ms is not None else 0,
+                    qe.stride(0),
+                    qe.stride(1),
+                    qe.stride(2),
+                    qk_weighted.stride(0),
+                    qk_weighted.stride(1),
+                    qk_weighted.stride(2),
+                    b_sq.stride(0),
+                    b_sq.stride(1),
+                    block_values.stride(0),
+                    block_values.stride(2),
+                    block_values.stride(3),
+                    block_values.stride(1),
+                    block_indices.stride(0),
+                    block_indices.stride(2),
+                    block_indices.stride(3),
+                    block_indices.stride(1),
+                    num_tokens,
+                    hw,
+                    ck,
+                    scale,
+                    HAS_MS=ms is not None,
+                    TOPK_PAD=topk_pad,
+                )
+        else:
+            with section('affinity_triton_kernel'):
+                _sparse_topk_affinity_no_qe_kernel[grid](
+                    mk,
+                    ms if ms is not None else mk.new_empty((bs, 1)),
+                    qk,
+                    block_values,
+                    block_indices,
+                    mk.stride(0),
+                    mk.stride(1),
+                    mk.stride(2),
+                    ms.stride(0) if ms is not None else 0,
+                    ms.stride(1) if ms is not None else 0,
+                    qk.stride(0),
+                    qk.stride(1),
+                    qk.stride(2),
+                    block_values.stride(0),
+                    block_values.stride(2),
+                    block_values.stride(3),
+                    block_values.stride(1),
+                    block_indices.stride(0),
+                    block_indices.stride(2),
+                    block_indices.stride(3),
+                    block_indices.stride(1),
+                    num_tokens,
+                    hw,
+                    ck,
+                    scale,
+                    HAS_MS=ms is not None,
+                    TOPK_PAD=topk_pad,
+                )
 
-    topk_values = topk_values_hw.transpose(1, 2).contiguous().float()
-    indices = indices_hw.transpose(1, 2).contiguous()
-    maxes = topk_values.max(dim=1, keepdim=True).values
-    weights = torch.exp(topk_values - maxes)
-    weights /= torch.sum(weights, dim=1, keepdim=True)
+    with section('affinity_select_topk'):
+        candidate_values = block_values.reshape(bs, hw, num_blocks * topk_pad)
+        candidate_indices = block_indices.reshape(bs, hw, num_blocks * topk_pad)
+        topk_values_hw, order = torch.topk(candidate_values, k=top_k, dim=2)
+        indices_hw = candidate_indices.gather(2, order)
+
+    with section('affinity_softmax'):
+        topk_values = topk_values_hw.transpose(1, 2).contiguous().float()
+        indices = indices_hw.transpose(1, 2).contiguous().to(torch.long)
+        maxes = topk_values.max(dim=1, keepdim=True).values
+        weights = torch.exp(topk_values - maxes)
+        weights /= torch.sum(weights, dim=1, keepdim=True)
 
     if return_usage:
-        usage = torch.zeros(bs, num_tokens, device=mk.device, dtype=weights.dtype)
-        usage.scatter_add_(1, indices.reshape(bs, -1), weights.reshape(bs, -1))
+        with section('affinity_usage'):
+            usage = torch.zeros(bs, num_tokens, device=mk.device, dtype=weights.dtype)
+            usage.scatter_add_(1, indices.reshape(bs, -1), weights.reshape(bs, -1))
         return weights, indices, usage
     return weights, indices
 
@@ -737,6 +754,7 @@ def sparse_topk_affinity(
     qe: Optional[torch.Tensor],
     top_k: int,
     *,
+    profiler=None,
     return_usage: bool = False,
     backend: str = "auto",
 ) -> tuple:
@@ -744,14 +762,15 @@ def sparse_topk_affinity(
     resolved = _resolve_sparse_backend(backend, mk)
 
     if resolved == "triton" and mk.is_cuda and _TRITON_AVAILABLE:
-        return _triton_topk_affinity(mk, ms, qk, qe, top_k, return_usage=return_usage)
+        return _triton_topk_affinity(
+            mk, ms, qk, qe, top_k, profiler=profiler, return_usage=return_usage)
 
     if not mk.is_cuda:
         similarity = get_similarity(mk, ms, qk, qe)
         return do_softmax_sparse(similarity, top_k=top_k, return_usage=return_usage)
 
     return _chunked_topk_softmax_sparse(
-        mk, ms, qk, qe, top_k, return_usage=return_usage,
+        mk, ms, qk, qe, top_k, profiler=profiler, return_usage=return_usage,
     )
 
 

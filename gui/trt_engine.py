@@ -15,6 +15,7 @@ import hashlib
 import logging
 import os
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -530,36 +531,43 @@ class TRTMaskDecoder:
         f4_raw: torch.Tensor,
         memory_readout: torch.Tensor,
         sensory: torch.Tensor,
+        profiler=None,
     ):
         """Run mask decoder.  Inputs may have fewer objects than engine max —
         they will be padded to ``self.num_objects`` automatically.
 
         Returns ``(new_sensory, logits)`` sliced back to actual object count.
         """
+        section = profiler.section if profiler is not None else nullcontext
         actual_no = memory_readout.shape[1]
         need_pad = actual_no < self.num_objects
 
-        if need_pad:
-            pad_no = self.num_objects - actual_no
-            memory_readout = nn.functional.pad(memory_readout, (0, 0, 0, 0, 0, 0, 0, pad_no))
-            sensory = nn.functional.pad(sensory, (0, 0, 0, 0, 0, 0, 0, pad_no))
+        with section('trt_mask_pad_inputs'):
+            if need_pad:
+                pad_no = self.num_objects - actual_no
+                memory_readout = nn.functional.pad(memory_readout, (0, 0, 0, 0, 0, 0, 0, pad_no))
+                sensory = nn.functional.pad(sensory, (0, 0, 0, 0, 0, 0, 0, pad_no))
 
-        inputs = {
-            "f8_raw": f8_raw.contiguous().float(),
-            "f4_raw": f4_raw.contiguous().float(),
-            "memory_readout": memory_readout.contiguous().float(),
-            "sensory": sensory.contiguous().float(),
-        }
-        outputs: dict[str, torch.Tensor] = {}
-        for name, (shape, dtype) in self._output_specs.items():
-            outputs[name] = torch.empty(shape, dtype=dtype, device=self._device)
+        with section('trt_mask_prepare_inputs'):
+            inputs = {
+                "f8_raw": f8_raw.contiguous().float(),
+                "f4_raw": f4_raw.contiguous().float(),
+                "memory_readout": memory_readout.contiguous().float(),
+                "sensory": sensory.contiguous().float(),
+            }
+        with section('trt_mask_alloc_outputs'):
+            outputs: dict[str, torch.Tensor] = {}
+            for name, (shape, dtype) in self._output_specs.items():
+                outputs[name] = torch.empty(shape, dtype=dtype, device=self._device)
 
-        for name, tensor in inputs.items():
-            self._context.set_tensor_address(name, tensor.data_ptr())
-        for name, tensor in outputs.items():
-            self._context.set_tensor_address(name, tensor.data_ptr())
+        with section('trt_mask_bind_io'):
+            for name, tensor in inputs.items():
+                self._context.set_tensor_address(name, tensor.data_ptr())
+            for name, tensor in outputs.items():
+                self._context.set_tensor_address(name, tensor.data_ptr())
 
-        _execute_trt_context(self._context, self._stream, self._device, "TRTMaskDecoder")
+        with section('trt_mask_execute'):
+            _execute_trt_context(self._context, self._stream, self._device, "TRTMaskDecoder")
 
         new_sensory = outputs["new_sensory"]
         logits = outputs["logits"]
