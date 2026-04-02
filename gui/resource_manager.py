@@ -467,14 +467,25 @@ class ResourceManager:
             n += 1
         return n
 
-    def snapshot_masks_named(self, name: str) -> str:
-        """Copy current masks dir to masks_<name>. Returns the name used."""
+    def snapshot_masks_named(self, name: str, copy_all: bool = False, ti: int = None) -> str:
+        """Snapshot masks into masks_<name>.
+
+        copy_all=True  → copy the entire mask directory.
+        copy_all=False → copy only the single mask for frame *ti*.
+        """
         dest = path.join(self.workspace, f'masks_{name}')
         # Wait for pending saves to flush
         self.save_queue.join()
-        if path.exists(dest):
-            shutil.rmtree(dest)
-        shutil.copytree(self.mask_dir, dest)
+        if copy_all:
+            if path.exists(dest):
+                shutil.rmtree(dest)
+            shutil.copytree(self.mask_dir, dest)
+        else:
+            os.makedirs(dest, exist_ok=True)
+            assert ti is not None
+            src = path.join(self.mask_dir, self.names[ti] + '.png')
+            if path.exists(src):
+                shutil.copy2(src, dest)
         return name
 
     def switch_mask_dir(self, slot: str = None):

@@ -126,6 +126,7 @@ class MainController():
 
         # mask slot tracking (None = primary "masks" dir)
         self._current_mask_slot = None
+        self._previous_mask_slot = None
 
         # class power weights: index 0 = background (always 1.0), 1..N = per-class
         self.class_power_weights = torch.ones(self.num_objects + 1, dtype=torch.float)
@@ -175,7 +176,7 @@ class MainController():
 
         self.gui.show()
         self._refresh_global_memory_list()
-        self._update_mask_slot_button()
+        self._update_mask_slot_buttons()
         self.gui.text('Initialized.')
         self.initialized = True
 
@@ -830,7 +831,7 @@ class MainController():
         self.gui.tl_slider.setValue(self.curr_ti)
 
     def on_play_video_timer_x4(self):
-        self.curr_ti += 4
+        self.curr_ti += 10
         if self.curr_ti > self.T - 1:
             self.curr_ti = 0
         self.gui.tl_slider.setValue(self.curr_ti)
@@ -1500,51 +1501,66 @@ class MainController():
     # ── Mask slot management (snapshot / switch / clear-to-end) ──────
 
     def on_snapshot_masks(self):
-        """Copy the current masks to a named slot for comparison."""
+        """Copy masks to a named slot for comparison."""
         if self.propagating:
             return
-        from PySide6.QtWidgets import QInputDialog
-        default_name = str(self.res_man.next_free_mask_slot())
-        name, ok = QInputDialog.getText(
-            self.gui, 'Snapshot masks',
-            'Folder suffix (will be saved as masks_<name>):',
-            text=default_name,
-        )
-        if not ok or not name.strip():
+        from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
+                                       QLabel, QLineEdit, QCheckBox,
+                                       QDialogButtonBox)
+        dlg = QDialog(self.gui)
+        dlg.setWindowTitle('Save version')
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel('Version name (saved as masks_<name>):'))
+        name_edit = QLineEdit(str(self.res_man.next_free_mask_slot()))
+        layout.addWidget(name_edit)
+        copy_all_cb = QCheckBox('Copy all masks (otherwise current frame only)')
+        copy_all_cb.setChecked(False)
+        layout.addWidget(copy_all_cb)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        name = name.strip()
-        self.gui.text(f'Saving mask snapshot to masks_{name}...')
+        name = name_edit.text().strip()
+        if not name:
+            return
+        copy_all = copy_all_cb.isChecked()
+        self.gui.text(f'Saving version masks_{name}...')
         self.gui.process_events()
-        self.res_man.snapshot_masks_named(name)
-        self.gui.text(f'Masks copied to masks_{name}.')
-        self._update_mask_slot_button()
+        self.res_man.snapshot_masks_named(name, copy_all=copy_all, ti=self.curr_ti)
+        what = 'all masks' if copy_all else f'frame {self.curr_ti}'
+        self.gui.text(f'Version masks_{name} saved ({what}).')
+        self._update_mask_slot_buttons()
 
-    def on_switch_mask_slot(self):
-        """Cycle through mask slots: masks → masks_2 → masks_3 → ... → masks."""
-        if self.propagating:
+    def on_switch_to_slot(self, slot: str | None):
+        """Switch to a specific mask slot (None = primary 'masks')."""
+        if self.propagating or slot == self._current_mask_slot:
             return
-        slots = self.res_man.get_available_mask_slots()  # e.g. ['2', '3', 'exp_a']
-        if not slots:
-            self.gui.text('No mask snapshots to switch to. Use Snapshot first.')
-            return
-
-        # Build cycle: None (primary) → '2' → '3' → 'exp_a' → None → ...
-        cycle = [None] + slots
-        current = self._current_mask_slot
-        try:
-            idx = cycle.index(current)
-            next_slot = cycle[(idx + 1) % len(cycle)]
-        except ValueError:
-            next_slot = cycle[0]
-
-        self.res_man.switch_mask_dir(next_slot)
-        self._current_mask_slot = next_slot
-        # Reload current frame from the new mask dir
+        self._previous_mask_slot = self._current_mask_slot
+        self.res_man.switch_mask_dir(slot)
+        self._current_mask_slot = slot
         self.load_current_image_mask()
         self.show_current_frame()
-        label = 'masks' if next_slot is None else f'masks_{next_slot}'
+        label = 'masks' if slot is None else f'masks_{slot}'
         self.gui.text(f'Switched to {label}.')
-        self._update_mask_slot_button()
+        self._update_mask_slot_buttons()
+
+    def on_switch_mask_slot(self):
+        """W key: A/B toggle between current and previous mask slot."""
+        if self.propagating:
+            return
+        prev = self._previous_mask_slot
+        if prev == self._current_mask_slot:
+            self.gui.text('No previous slot to toggle to.')
+            return
+        # Check the previous slot still exists
+        if prev is not None and prev not in self.res_man.get_available_mask_slots():
+            self.gui.text(f'Previous slot masks_{prev} no longer exists.')
+            return
+        self.on_switch_to_slot(prev)
 
     def on_clear_masks_to_end(self):
         """Remove all mask files from the current frame to the end of the video."""
@@ -1570,12 +1586,9 @@ class MainController():
         self.show_current_frame()
         self.gui.text(f'Deleted {deleted} mask(s) from frame {self.curr_ti} to end.')
 
-    def _update_mask_slot_button(self):
-        slot = self._current_mask_slot
-        label = 'masks' if slot is None else f'masks_{slot}'
+    def _update_mask_slot_buttons(self):
         slots = self.res_man.get_available_mask_slots()
-        n = len(slots)
-        self.gui.switch_mask_slot_button.setText(f'Switch [{label}] ({n})')
+        self.gui.update_mask_slot_buttons(slots, self._current_mask_slot)
 
     def on_save_soft_mask_toggle(self):
         self.save_soft_mask = self.gui.save_soft_mask_checkbox.isChecked()

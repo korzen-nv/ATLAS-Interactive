@@ -195,7 +195,7 @@ class GUI(QWidget):
         # set up some buttons
         self.play_button = QPushButton('Play video')
         self.play_button.clicked.connect(self.on_play_video)
-        self.play_x4_button = QPushButton('Play x4')
+        self.play_x4_button = QPushButton('Play x10')
         self.play_x4_button.clicked.connect(self.on_play_video_x4)
         self.commit_button = QPushButton('Commit to permanent memory')
         self.commit_button.clicked.connect(controller.on_commit)
@@ -243,13 +243,16 @@ class GUI(QWidget):
         self.remove_object_all_button.clicked.connect(controller.on_remove_object_all_frames)
 
         # Mask slot management
-        self.snapshot_masks_button = QPushButton('Snapshot masks')
-        self.snapshot_masks_button.setToolTip('Copy current masks to a new slot for comparison')
+        self.snapshot_masks_button = QPushButton('Save version')
+        self.snapshot_masks_button.setToolTip('Save a copy of masks for comparison')
         self.snapshot_masks_button.clicked.connect(controller.on_snapshot_masks)
 
-        self.switch_mask_slot_button = QPushButton('Switch [masks] (0)')
-        self.switch_mask_slot_button.setToolTip('Cycle through mask snapshots')
-        self.switch_mask_slot_button.clicked.connect(controller.on_switch_mask_slot)
+        # Mask slot buttons — dynamically rebuilt by update_mask_slot_buttons()
+        self._mask_slot_button_container = QWidget()
+        self._mask_slot_button_layout = QHBoxLayout(self._mask_slot_button_container)
+        self._mask_slot_button_layout.setContentsMargins(0, 0, 0, 0)
+        self._mask_slot_button_layout.setSpacing(2)
+        self._mask_slot_buttons: list[QPushButton] = []
 
         self.clear_masks_to_end_button = QPushButton('Clear masks → end')
         self.clear_masks_to_end_button.setToolTip('Delete all masks from current frame to the end')
@@ -414,8 +417,6 @@ class GUI(QWidget):
         interact_topbox.addWidget(self.reset_frame_button)
         interact_topbox.addWidget(self.reset_object_button)
         interact_topbox.addWidget(self.remove_object_all_button)
-        interact_topbox.addWidget(self.snapshot_masks_button)
-        interact_topbox.addWidget(self.switch_mask_slot_button)
         interact_topbox.addWidget(self.clear_masks_to_end_button)
         interact_topbox.addWidget(self.frame_name)
         interact_topbox.addWidget(self.soft_mask_indicator)
@@ -425,6 +426,8 @@ class GUI(QWidget):
         interact_botbox.addWidget(self.object_dial)
         interact_botbox.addWidget(QLabel('Visualization mode'))
         interact_botbox.addWidget(self.combo)
+        interact_botbox.addWidget(self.snapshot_masks_button)
+        interact_botbox.addWidget(self._mask_slot_button_container)
 
         interact_subbox.addLayout(interact_topbox)
         interact_subbox.addLayout(interact_botbox)
@@ -798,21 +801,21 @@ class GUI(QWidget):
             # stop x4 if running
             if self.timer_x4.isActive():
                 self.timer_x4.stop()
-                self.play_x4_button.setText('Play x4')
+                self.play_x4_button.setText('Play x10')
             self.timer.start(1000 // 30)
             self.play_button.setText('Stop video')
 
     def on_play_video_x4(self):
         if self.timer_x4.isActive():
             self.timer_x4.stop()
-            self.play_x4_button.setText('Play x4')
+            self.play_x4_button.setText('Play x10')
         else:
             # stop normal play if running
             if self.timer.isActive():
                 self.timer.stop()
                 self.play_button.setText('Play video')
             self.timer_x4.start(1000 // 30)
-            self.play_x4_button.setText('Stop x4')
+            self.play_x4_button.setText('Stop x10')
 
     def open_file(self, prompt):
         options = QFileDialog.Options()
@@ -982,6 +985,27 @@ class GUI(QWidget):
             slider.blockSignals(False)
         for label in self._class_power_labels:
             label.setText('1.00')
+
+    def update_mask_slot_buttons(self, slots: list[str], active_slot: str | None):
+        """Rebuild the mask slot button row with one button per slot."""
+        # Clear old buttons
+        for btn in self._mask_slot_buttons:
+            self._mask_slot_button_layout.removeWidget(btn)
+            btn.deleteLater()
+        self._mask_slot_buttons.clear()
+
+        # Always add "masks" (primary)
+        all_slots = [None] + slots
+        for slot in all_slots:
+            label = 'masks' if slot is None else f'masks_{slot}'
+            btn = QPushButton(label)
+            btn.setFixedHeight(24)
+            is_active = (slot == active_slot)
+            if is_active:
+                btn.setStyleSheet('font-weight: bold; border: 2px solid #4488ff;')
+            btn.clicked.connect(functools.partial(self.controller.on_switch_to_slot, slot))
+            self._mask_slot_button_layout.addWidget(btn)
+            self._mask_slot_buttons.append(btn)
 
     def highlight_selected_class(self, obj_id: int):
         """Visually highlight the selected class row."""
