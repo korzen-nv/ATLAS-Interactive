@@ -37,6 +37,10 @@ def get_arguments():
                         help='override max_internal_size (e.g. 720, 1080)')
     parser.add_argument('--profile', action='store_true',
                         help='enable CUDA step profiler (prints timing every 50 frames)')
+    parser.add_argument('--auto-propagate-forward', action='store_true',
+                        help='start forward propagation automatically after the GUI opens')
+    parser.add_argument('--auto-pause-after', type=float, default=None,
+                        help='pause propagation after N seconds while keeping the app open')
 
     args = parser.parse_args()
     return args
