@@ -1,5 +1,6 @@
 import os
 from collections import deque
+from contextlib import contextmanager
 from os import path
 import logging
 from typing import Literal
@@ -36,6 +37,60 @@ from gui.crf_refine import apply_crf as _apply_crf, is_available as _crf_availab
 from gui.torch_rt import TorchRT
 
 log = logging.getLogger()
+
+
+class _PropagationWallProfiler:
+    """Lightweight wall-clock profiler for the propagation loop."""
+
+    def __init__(self, print_every: int = 50) -> None:
+        self.enabled = False
+        self.print_every = print_every
+        self._accum: dict[str, float] = {}
+        self._order: list[str] = []
+        self._count = 0
+
+    def add(self, label: str, seconds: float) -> None:
+        if not self.enabled:
+            return
+        if label not in self._accum:
+            self._accum[label] = 0.0
+            self._order.append(label)
+        self._accum[label] += seconds
+
+    @contextmanager
+    def section(self, label: str):
+        if not self.enabled:
+            yield
+            return
+        import time
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.add(label, time.perf_counter() - start)
+
+    def finish_frame(self) -> None:
+        if not self.enabled:
+            return
+        self._count += 1
+        if self._count >= self.print_every:
+            self._print()
+
+    def flush(self) -> None:
+        if not self.enabled or self._count == 0:
+            return
+        self._print()
+
+    def _print(self) -> None:
+        n = self._count
+        print(f"\n=== Propagation wall profiler ({n} frames) ===")
+        for name in self._order:
+            total_s = self._accum.get(name, 0.0)
+            print(f"  {name:<40s} {1000.0 * total_s / n:6.2f} ms/frame")
+        print()
+        self._accum.clear()
+        self._order.clear()
+        self._count = 0
 
 
 
@@ -78,6 +133,8 @@ class MainController():
         self.initialize_networks()
         self.processor = self._propagation
         self.gui = GUI(self, self.cfg)
+        self.propagation_profiler = _PropagationWallProfiler()
+        self.propagation_profiler.enabled = cfg.get('profile', False)
 
         # initialize control info
         self.length: int = self.res_man.length
@@ -688,6 +745,7 @@ class MainController():
     def on_propagate(self):
         # start to propagate
         with autocast(self.device, enabled=(self.amp and self.device == 'cuda')):
+            prop_prof = self.propagation_profiler
             self.convert_current_image_mask_torch()
 
             self.gui.text(f'Propagation started at t={self.curr_ti}.')
@@ -737,27 +795,38 @@ class MainController():
             def _process_pending():
                 """Process the previous frame's results (runs while GPU computes next frame)."""
                 nonlocal _prop_frames
-                self.curr_ti = _pending_ti
-                self.curr_image_np = _pending_image_np
-                self.curr_image_torch = _pending_image_torch
-                self.curr_prob = _pending_prob
+                with prop_prof.section('pending_total'):
+                    self.curr_ti = _pending_ti
+                    self.curr_image_np = _pending_image_np
+                    self.curr_image_torch = _pending_image_torch
+                    self.curr_prob = _pending_prob
 
-                self.curr_mask = torch_prob_to_numpy_mask(self.curr_prob)
-                if self.fill_gaps:
-                    self.curr_mask = self.fill_mask_gaps(self.curr_mask)
+                    with prop_prof.section('pending_mask_to_numpy'):
+                        self.curr_mask = torch_prob_to_numpy_mask(self.curr_prob)
+                    if self.fill_gaps:
+                        with prop_prof.section('pending_fill_gaps'):
+                            self.curr_mask = self.fill_mask_gaps(self.curr_mask)
 
-                self.save_current_mask()
-                _prop_tis.append(self.curr_ti)
-                _prop_frames += 1
+                    with prop_prof.section('pending_save_mask'):
+                        self.save_current_mask()
+                    _prop_tis.append(self.curr_ti)
+                    _prop_frames += 1
 
-                if _prop_frames % _THROTTLE_N == 0:
-                    self.show_current_frame(fast=True)
-                    self.update_memory_gauges()
-                    self.gui.process_events()
-                else:
-                    self.gui.update_slider(self.curr_ti)
+                    if _prop_frames % _THROTTLE_N == 0:
+                        with prop_prof.section('pending_display_frame'):
+                            self.show_current_frame(fast=True)
+                        with prop_prof.section('pending_update_memory_gauges'):
+                            self.update_memory_gauges()
+                        with prop_prof.section('pending_process_events'):
+                            self.gui.process_events()
+                    else:
+                        with prop_prof.section('pending_update_slider'):
+                            self.gui.update_slider(self.curr_ti)
 
-            for data in loader:
+                prop_prof.finish_frame()
+
+            loader_iter = iter(loader)
+            while True:
                 if not self.propagating:
                     break
                 if _auto_pause_after is not None and _auto_pause_after > 0:
@@ -766,17 +835,26 @@ class MainController():
                         self.propagating = False
                         break
 
-                curr_image_np, curr_image_torch = data
-                curr_image_torch = curr_image_torch.to(self.device, non_blocking=True)
-                self.propagate_fn()
+                _loader_t0 = time.perf_counter()
+                try:
+                    curr_image_np, curr_image_torch = next(loader_iter)
+                except StopIteration:
+                    break
+                prop_prof.add('loader_wait', time.perf_counter() - _loader_t0)
+                with prop_prof.section('frame_upload'):
+                    curr_image_torch = curr_image_torch.to(self.device, non_blocking=True)
+                with prop_prof.section('advance_frame'):
+                    self.propagate_fn()
                 curr_ti = self.curr_ti
 
                 # Launch inference (GPU works asynchronously)
                 self.curr_image_torch = curr_image_torch
-                curr_prob = self.processor.step(curr_image_torch,
-                                                frame_idx=curr_ti)
+                with prop_prof.section('step_dispatch'):
+                    curr_prob = self.processor.step(curr_image_torch,
+                                                    frame_idx=curr_ti)
                 if self.crf_enabled and _crf_available():
-                    curr_prob = _apply_crf(curr_image_np, curr_prob)
+                    with prop_prof.section('crf'):
+                        curr_prob = _apply_crf(curr_image_np, curr_prob)
 
                 # While GPU may still be finishing, process PREVIOUS frame's results
                 if _pending_prob is not None:
@@ -796,6 +874,8 @@ class MainController():
             # Process the last pending frame
             if _pending_prob is not None:
                 _process_pending()
+
+            prop_prof.flush()
 
             _total = time.perf_counter() - _prop_t0
             _avg_fps = _prop_frames / _total if _total > 0 else 0
